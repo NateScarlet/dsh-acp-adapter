@@ -401,6 +401,26 @@ export interface AcpNativeElicitationDeps {
   readonly onUnavailable?: (issue: AcpNativeQuestionUnavailable) => void | Promise<void>
 }
 
+/**
+ * Some Agents encode a select question's free-text answer as a separate optional
+ * string property named `<key>_custom`. DSH's native question already offers a
+ * free-text answer for every question, so that property must not become its own
+ * blocking page; it only receives the base question's custom answer.
+ */
+function freeTextCompanions(fields: readonly AcpElicitationFieldView[]): ReadonlyMap<string, AcpElicitationFieldView> {
+  const suffix = '_custom'
+  const byName = new Map(fields.map((field) => [field.name, field]))
+  const companions = new Map<string, AcpElicitationFieldView>()
+  for (const field of fields) {
+    if (field.type !== 'string' || field.required || (field.options?.length ?? 0) > 0) continue
+    if (!field.name.endsWith(suffix)) continue
+    const base = byName.get(field.name.slice(0, -suffix.length))
+    if (base === undefined || base.type !== 'string' || (base.options?.length ?? 0) === 0) continue
+    companions.set(base.name, field)
+  }
+  return companions
+}
+
 /** DSH returns labels, so every displayed choice must map unambiguously to its wire value. */
 function displayOptions(options: NonNullable<AcpElicitationFieldView['options']>) {
   const titles = options.map((option) => option.title?.trim() || option.value)
@@ -454,7 +474,19 @@ export function createAcpNativeElicitationHandler(
         options,
       }
     })
-    const questions = fields.map((field, index) => {
+    const companions = freeTextCompanions(fields)
+    // DSH questions must be answered or skipped; an optional free-text field
+    // cannot express "leave empty" without becoming another blocking page.
+    // Option-bearing fields stay presentable because they are the question
+    // itself, and their native free-text answer is carried by the companion.
+    const presentedFields = fields.filter(
+      (field) => field.required || field.type !== 'string' || field.options.length > 0,
+    )
+    if (presentedFields.length === 0) {
+      const content = validateValues(params, [])
+      return content === undefined ? { action: 'cancel' } : { action: 'accept', content }
+    }
+    const questions = presentedFields.map((field, index) => {
       // Only a verified, exact Codex bridge message is replaced. Other agents'
       // explanations remain intact, including any additional approval context.
       const introduction =
@@ -507,17 +539,22 @@ export function createAcpNativeElicitationHandler(
       const answer = await presenter.ask({ questions, agent, ...(signal === undefined ? {} : { signal }) })
       if (signal?.aborted) return { action: 'cancel' }
       const values: { name: string; value: string | number | boolean | readonly string[] }[] = []
-      for (const field of fields) {
+      for (const field of presentedFields) {
         const item = answer.answers.find((candidate) => candidate.id === field.name)
         if (item === undefined) continue
-        // Enum answers must be explicit displayed choices; never interpret free
-        // text as a permission scope or guess from a protocol identifier.
+        // Choices must be explicit displayed labels; never interpret free text
+        // as a permission scope or guess from a protocol identifier.
         if (
           field.options.length > 0 &&
-          (item.custom?.trim() ||
-            item.selected.some((label) => !field.options.some((option) => option.label === label)))
+          item.selected.some((label) => !field.options.some((option) => option.label === label))
         )
           return { action: 'cancel' }
+        const custom = item.custom?.trim() ?? ''
+        const companion = companions.get(field.name)
+        // Free text on an option question is only representable through the
+        // Agent's own companion property; an enum answer must stay within its
+        // displayed choices.
+        if (custom !== '' && field.options.length > 0 && companion === undefined) return { action: 'cancel' }
         if (field.type !== 'array' && item.selected.length > 1) return { action: 'cancel' }
         const selected = item.selected.map(
           (label) => field.options.find((option) => option.label === label)?.value ?? label,
@@ -533,6 +570,8 @@ export function createAcpNativeElicitationHandler(
           const value = Number(raw)
           if (!Number.isFinite(value)) return { action: 'cancel' }
           values.push({ name: field.name, value })
+        } else if (custom !== '' && companion !== undefined) {
+          values.push({ name: companion.name, value: item.custom! })
         } else {
           values.push({ name: field.name, value: selected[0] ?? item.custom ?? '' })
         }

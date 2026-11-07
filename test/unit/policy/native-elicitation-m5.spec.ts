@@ -172,6 +172,102 @@ describe('native ACP form elicitation bridge (M5c)', () => {
     expect(requested).toEqual({ id: 'reason', question: message, detail: description })
   })
 
+  it('does not present an Agent free-text companion as its own question', async () => {
+    let asked: readonly { id: string; options?: readonly { label: string }[] }[] = []
+    const handler = createAcpNativeElicitationHandler({
+      userQuestions: {
+        ask: async ({ questions }) => {
+          asked = questions
+          return { answers: [{ id: 'q0', selected: [questions[0]!.options![0]!.label] }] }
+        },
+      },
+      getAgent: () => ({}),
+    })
+
+    const response = await handler(
+      form(
+        {
+          q0: {
+            type: 'string',
+            title: '复现测试',
+            oneOf: [
+              { const: 'a', title: '候选 A' },
+              { const: 'b', title: '候选 B' },
+            ],
+          },
+          q0_custom: { type: 'string', title: '复现测试 (other)', description: 'Type your own answer' },
+        },
+        [],
+      ),
+    )
+
+    expect(asked.map((item) => item.id)).toEqual(['q0'])
+    expect(asked[0]?.options?.map((option) => option.label)).toEqual(['候选 A', '候选 B'])
+    expect(response).toEqual({ action: 'accept', content: { q0: 'a' } })
+  })
+
+  it('routes a select question free-text answer to the Agent companion property', async () => {
+    const handler = createAcpNativeElicitationHandler({
+      userQuestions: {
+        ask: async () => ({ answers: [{ id: 'q0', selected: [], custom: '自定义答案' }] }),
+      },
+      getAgent: () => ({}),
+    })
+
+    const response = await handler(
+      form(
+        {
+          q0: {
+            type: 'string',
+            title: '复现测试',
+            oneOf: [
+              { const: 'a', title: '候选 A' },
+              { const: 'b', title: '候选 B' },
+            ],
+          },
+          q0_custom: { type: 'string', title: '复现测试 (other)', description: 'Type your own answer' },
+        },
+        [],
+      ),
+    )
+
+    expect(response).toEqual({ action: 'accept', content: { q0_custom: '自定义答案' } })
+  })
+
+  it('omits optional free text fields that are not a select companion', async () => {
+    let asked: readonly { id: string }[] = []
+    const handler = createAcpNativeElicitationHandler({
+      userQuestions: {
+        ask: async ({ questions }) => {
+          asked = questions
+          return { answers: [{ id: 'channel', selected: ['stable'] }] }
+        },
+      },
+      getAgent: () => ({}),
+    })
+
+    const response = await handler(
+      form({ note: { type: 'string' }, channel: { type: 'string', enum: ['stable', 'canary'] } }, ['channel']),
+    )
+
+    expect(asked.map((item) => item.id)).toEqual(['channel'])
+    expect(response).toEqual({ action: 'accept', content: { channel: 'stable' } })
+  })
+
+  it('accepts a form containing only optional free text without asking', async () => {
+    const ask = vi.fn(async () => ({ answers: [] }))
+    const handler = createAcpNativeElicitationHandler({
+      userQuestions: { ask } as unknown as AcpNativeUserQuestionService,
+      getAgent: () => ({}),
+    })
+
+    await expect(handler(form({ note: { type: 'string' } }, []))).resolves.toEqual({
+      action: 'accept',
+      content: {},
+    })
+    expect(ask).not.toHaveBeenCalled()
+  })
+
   it('declines URL and unsupported, nested, sensitive or malformed schemas before asking', async () => {
     const ask = vi.fn(async () => ({ answers: [] }))
     const userQuestions = { ask } as unknown as AcpNativeUserQuestionService
