@@ -215,6 +215,15 @@ type AgentSessionOptionWrite =
   | { readonly kind: 'config'; readonly id: string; readonly value: string | boolean }
   | { readonly kind: 'mode'; readonly id: string }
 
+/**
+ * ACP 路由的默认上下文容量假设。ACP 只在运行期通过 usage_update 报告当前会话当前模型的
+ * 上下文窗口，切换前没有可读取的每模型静态容量；DSH 的自动压缩在提交新模型前要求精确
+ * 模型元数据声明容量，因此按业界常见的 1M 取默认值 1_048_576 tokens。该值只是对 ACP
+ * 模型的默认假设；超过 1M 的容量或更小的真实窗口由外部 Agent 自行压缩/报错，不在当前
+ * 适配器承诺内。
+ */
+const ACP_DEFAULT_CONTEXT_WINDOW = 1_048_576
+
 /** Prove the child seed ends at the parent's durable ACP binding head. */
 function isLatestForkCut(
   session: SessionLike | undefined,
@@ -1068,26 +1077,11 @@ export class AcpProfileAdapter extends LlmAdapter {
     this.currentProbeGeneration()?.probe.invalidateProbe?.(routeId)
   }
 
-  override async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+  override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const generation = this.currentProbeGeneration()
     if (generation === undefined)
       throw new LlmError(`ACP profile "${this.profileId}" is no longer configured`, 'ACP_UNKNOWN_PROFILE')
-    const models = await generation.probe.listModels(provider)
-    const found = models.find((entry) => entry.id === model)
-    const reasoning = reasoningInfoFromConfigOptions(
-      this.profileId,
-      generation.config,
-      generation.probe.configOptionsForModel === undefined
-        ? generation.probe.configOptions?.(provider)
-        : generation.probe.configOptionsForModel(provider, model),
-    )
-    const { inputModalities: _probeModalities, ...identity } = found ?? { provider, id: model, name: model }
-    const inputModalities = this.currentInputModalities(provider, model, generation)
-    return {
-      ...identity,
-      ...(reasoning === undefined ? {} : { reasoning }),
-      ...(inputModalities === undefined ? {} : { inputModalities }),
-    }
+    return await this.resolveModelForGeneration(provider, model, generation, signal)
   }
 
   /**
@@ -1184,6 +1178,7 @@ export class AcpProfileAdapter extends LlmAdapter {
     const inputModalities = this.currentInputModalities(provider, model, generation)
     return {
       ...identity,
+      context: { contextWindow: ACP_DEFAULT_CONTEXT_WINDOW },
       ...(reasoning === undefined ? {} : { reasoning }),
       ...(inputModalities === undefined ? {} : { inputModalities }),
     }

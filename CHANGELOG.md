@@ -8,6 +8,7 @@ User-facing changes and upgrade notes. See [GitHub Releases](https://github.com/
 
 ### 中文
 
+- 修复在已有对话的 ACP 会话内切换同一 profile 的模型被 `MODEL_SWITCH_COMPACTION_FAILED` 拒绝的问题：ACP 路由的精确模型元数据声明默认 1M 上下文容量，切换后继续沿用原 ACP 会话，旧历史保留，无需重建会话或绑定。
 - 升级兼容目标及精确官方依赖至 DSH `0.2.2-rc.1`，同步 Cordis 4.1 与 Node.js `>=24.9`。安装本版前请升级宿主，无需新增用户配置。
 - 适配新的批次工具执行接口：单次 ACP 调用按批次执行，并按当前轮次解析宿主工具准入，使按步骤启用的工具（如 Web 搜索与抓取）在 ACP 会话中继续可用；PTC 的 `run_code` 传输保持可用。
 - 适配异步会话投影注册：启动时等待注册完成并保留读取句柄。模型选择的读取与写入改用 Agent 模型接口，团队成员在创建时记录其绑定范围内保存的模型。
@@ -16,6 +17,7 @@ User-facing changes and upgrade notes. See [GitHub Releases](https://github.com/
 
 ### English
 
+- Fix model switches inside one profile being rejected with `MODEL_SWITCH_COMPACTION_FAILED` in existing ACP sessions: the ACP route's exact model metadata now declares the default 1M context capacity, and the switch keeps using the original ACP session with its history instead of rebuilding the session or binding.
 - Target DSH `0.2.2-rc.1` with exact published dependencies, Cordis 4.1 and Node.js `>=24.9`. Upgrade the host before installing this version; no additional user configuration is required.
 - Adapt to the batch tool-execution interface: one ACP call runs as a batch and resolves host tool admission for the current turn, so step-conditional tools such as Web search and fetch remain available in ACP sessions while the PTC `run_code` transport keeps working.
 - Adapt to asynchronous session-projection registration: activation awaits registration and retains its read handle. Model selection reads and writes use the Agent model API, and teammates record their binding-scoped saved model at creation.

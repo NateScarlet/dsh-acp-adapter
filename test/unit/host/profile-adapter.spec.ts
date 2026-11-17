@@ -69,6 +69,42 @@ const durableSidecar = {
   },
 } as unknown as AcpSidecar
 
+describe('ACP route context capacity', () => {
+  const defaultWindow = { contextWindow: 1_048_576 }
+
+  it('declares the default 1M window for catalog, fallback and stale-catalog models', async () => {
+    let models = [{ id: 'model-a', name: 'Model A', provider: 'acp-test' }]
+    const adapter = new AcpProfileAdapter(
+      'test',
+      () => profile(),
+      seam(),
+      () => undefined,
+      new Ledger(),
+      () => ({ listModels: async () => models }),
+      undefined,
+      durableSidecar,
+    )
+    const catalogModel = await adapter.resolveModel('acp-test', 'model-a')
+    expect(catalogModel.context).toEqual(defaultWindow)
+    const fallbackModel = await adapter.resolveModel('acp-test', 'model-unknown')
+    expect(fallbackModel).toMatchObject({
+      provider: 'acp-test',
+      id: 'model-unknown',
+      name: 'model-unknown',
+      context: defaultWindow,
+    })
+    const prepared = await adapter.prepareCall('acp-test', 'model-a')
+    expect(prepared.model.context).toEqual(defaultWindow)
+    await expect(adapter.listModels('acp-test')).resolves.toEqual(models)
+    // A stale or emptied probe catalogue must not remove the capacity.
+    models = []
+    await expect(adapter.resolveModel('acp-test', 'model-a')).resolves.toMatchObject({
+      id: 'model-a',
+      context: defaultWindow,
+    })
+  })
+})
+
 describe('AcpProfileAdapter generation and dispatch boundaries', () => {
   it('shares one profile probe cache between picker and health, including recheck', async () => {
     const current = profile('shared-agent')
