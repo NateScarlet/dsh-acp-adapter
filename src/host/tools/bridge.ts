@@ -755,16 +755,28 @@ export async function createDshToolBridge(
     }
   }
   // One ACP prompt is one admission scope: resolve step conditions once and
-  // release the admitted set when that prompt ends (or the lease closes).
+  // release the admitted sets when that prompt ends (or the lease closes).
   let admittedTools: { readonly generation: number; readonly set: Promise<ResolvedToolSet | undefined> } | undefined
+  // A re-registration that keeps the lease live still replaces definition
+  // identities, and the Host admits only identities that match the live
+  // registry. Retired sets stay open until the prompt ends because a call that
+  // already captured one must remain dispatchable.
+  const retainedAdmissions = new Set<Promise<ResolvedToolSet | undefined>>()
+  const disposeAdmission = (pending: Promise<ResolvedToolSet | undefined>): void => {
+    void pending.then(
+      (set) => set?.dispose(),
+      () => undefined,
+    )
+  }
   const disposeAdmittedTools = (): void => {
+    admittedTools = undefined
+    for (const pending of retainedAdmissions) disposeAdmission(pending)
+    retainedAdmissions.clear()
+  }
+  const retireAdmittedTools = (): void => {
     const current = admittedTools
     admittedTools = undefined
-    if (current !== undefined)
-      void current.set.then(
-        (set) => set?.dispose(),
-        () => undefined,
-      )
+    if (current !== undefined) retainedAdmissions.add(current.set)
   }
   const admittedToolsForPrompt = async (): Promise<ResolvedToolSet | undefined> => {
     const signal = prompt
@@ -777,16 +789,9 @@ export async function createDshToolBridge(
         : undefined)
     if (selection === undefined) return undefined
     if (admittedTools?.generation !== promptGeneration) {
-      const generation = promptGeneration
       const set = tools.resolve({ agent, modelSelection: selection, signal })
-      admittedTools = { generation, set }
-      // A prompt that ended before resolution finished must not retain the set.
-      void set.then(
-        (resolved) => {
-          if (generation !== promptGeneration) resolved.dispose()
-        },
-        () => undefined,
-      )
+      admittedTools = { generation: promptGeneration, set }
+      retainedAdmissions.add(set)
     }
     return await admittedTools.set
   }
@@ -1463,35 +1468,43 @@ export async function createDshToolBridge(
       promptGeneration++
       adapterPromptOrdinal = undefined
       presented.clear()
-      disposeAdmittedTools()
+      // The closed generation's bodies may still run until `drainPrompt`, and a
+      // PTC body resolves its nested calls while it runs; release them there.
+      retireAdmittedTools()
       // A definition reloaded during the prompt keeps it live there; once the
       // prompt is over, the stale binding can no longer serve later calls.
       if (!live()) void lease.close()
     },
     async drainPrompt() {
       const pending = [...drainingPrompts]
-      await Promise.all(
-        pending.map(async (scope) => {
-          while (scope.calls.size > 0)
-            await Promise.allSettled(
-              [...scope.calls].flatMap((call) => (call.promise === undefined ? [] : [call.promise])),
-            )
-          if ([...pendingFeedback.values()].some((entry) => entry.scope === scope))
-            throw new AcpHostSettlementError('ACP_HOST_FEEDBACK_COMMIT_FAILED', {
-              remoteOutcomeKnown: scope.remoteOutcomeKnown,
-            })
-          if (
-            scope.remoteOutcomeKnown &&
-            !scope.externallyAborted &&
-            scope.bodySignal?.aborted !== true &&
-            [...scope.terminalCalls].some((call) => call.abortedBeforeDispatch === true)
-          ) {
+      try {
+        await Promise.all(
+          pending.map(async (scope) => {
+            while (scope.calls.size > 0)
+              await Promise.allSettled(
+                [...scope.calls].flatMap((call) => (call.promise === undefined ? [] : [call.promise])),
+              )
+            if ([...pendingFeedback.values()].some((entry) => entry.scope === scope))
+              throw new AcpHostSettlementError('ACP_HOST_FEEDBACK_COMMIT_FAILED', {
+                remoteOutcomeKnown: scope.remoteOutcomeKnown,
+              })
+            if (
+              scope.remoteOutcomeKnown &&
+              !scope.externallyAborted &&
+              scope.bodySignal?.aborted !== true &&
+              [...scope.terminalCalls].some((call) => call.abortedBeforeDispatch === true)
+            ) {
+              drainingPrompts.delete(scope)
+              throw new AcpHostSettlementError('ACP_HOST_TOOL_NOT_DISPATCHED')
+            }
             drainingPrompts.delete(scope)
-            throw new AcpHostSettlementError('ACP_HOST_TOOL_NOT_DISPATCHED')
-          }
-          drainingPrompts.delete(scope)
-        }),
-      )
+          }),
+        )
+      } finally {
+        // `beginPrompt` disposes these before resolving a later prompt, so a
+        // concurrent start keeps its own admission.
+        if (prompt === undefined) disposeAdmittedTools()
+      }
     },
     async flushHostFeedback() {
       for (const [key, pending] of [...pendingFeedback]) {
@@ -1800,9 +1813,11 @@ export async function createDshToolBridge(
   }
   listeners.push(
     ctx.on('tools/change', () => {
-      // A schema-equal re-registration stays live for the active prompt; any
-      // real restriction, removal or schema change still closes immediately.
+      // A schema-equal re-registration stays live for the active prompt but
+      // replaces the identities its admission was resolved from; the next call
+      // re-resolves. Any real restriction, removal or schema change closes.
       if (!live()) void lease.close()
+      else retireAdmittedTools()
     }),
   )
   listeners.push(

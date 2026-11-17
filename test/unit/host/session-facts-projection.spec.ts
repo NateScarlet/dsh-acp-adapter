@@ -8,7 +8,11 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { SUBAGENT_DESCRIPTOR_VERSION } from '@deepseek-ai/dsh-subagent'
 import { EXTERNAL_SUBAGENT_DESCRIPTOR_PROVIDER } from '../../../src/contract/external-subagent.ts'
-import { acpSessionView, readSessionFacts } from '../../../src/host/composition/session-facts.ts'
+import {
+  acpSessionView,
+  readSessionFacts,
+  retainAcpExecutionProjection,
+} from '../../../src/host/composition/session-facts.ts'
 import { installAcpExecutionProjection } from '../../support/session-facts.ts'
 import { sessionFactsSchema } from '../../../src/domain/session/session-facts.ts'
 import type { AcpReplayPayloadV1 } from '../../../src/domain/session/acp-replay-payload.ts'
@@ -341,6 +345,21 @@ describe('ACP execution SessionProjection integration', () => {
     const state = sessionFactsSchema.parse(restored.checkpoint.acpExecution?.val)
     expect(state.openSteps).toHaveLength(1)
     expect(state.turnOpen).toBe(true)
+  })
+
+  it('releases the retained projection handle with its disposer', async () => {
+    const ctx = new Context()
+    contexts.push(ctx)
+    const handle = { stateOf: vi.fn(), readerFor: vi.fn(), dispose: vi.fn(async () => undefined) }
+    const retention = retainAcpExecutionProjection(ctx, handle as never)
+    expect(readSessionFacts(ctx, {} as never)).toBeUndefined()
+    expect(handle.stateOf).toHaveBeenCalledOnce()
+    await retention.release()
+    expect(handle.dispose).toHaveBeenCalledOnce()
+    expect(() => readSessionFacts(ctx, {} as never)).toThrow('ACP execution projection is not ready')
+    // An accepted transaction may still read through the composition-owned
+    // reader after the published service is withdrawn.
+    expect(retention.read({} as never)).toBeUndefined()
   })
 
   it('uses only the compact replay marker shape in checkpoint state', async () => {
