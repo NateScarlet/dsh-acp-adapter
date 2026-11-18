@@ -4718,6 +4718,13 @@ export class AcpProfileAdapter extends LlmAdapter {
               this.claudeDraftDegradationReported = true
               this.log?.(message)
             },
+            // 闲置回收无法证明托管范围退出时走宿主告警通道，绝不静默当作成功。
+            onIdleProcessClose: (outcome: { readonly confirmed: boolean }): void => {
+              if (!outcome.confirmed)
+                this.log?.(
+                  `ACP idle process reclamation for session ${sessionId} could not confirm managed-range exit; process state remains unknown`,
+                )
+            },
           }),
       config: profile,
       subprocess: processSeam,

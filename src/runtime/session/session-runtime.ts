@@ -174,6 +174,13 @@ export interface AcpSessionRuntimeOptions {
   readonly unannouncedIdleMs?: number
   /** Internal seam for an automatic turn that no Host call has adopted. */
   readonly agentTurnAdoptionMs?: number
+  /**
+   * 内部有界的 agent 进程闲置回收窗口（毫秒）。不是用户配置项；
+   * 测试注入短值覆盖，生产使用 {@link DEFAULT_IDLE_PROCESS_CLOSE_MS}。
+   */
+  readonly idleProcessCloseMs?: number
+  /** 每次闲置回收尝试的拆除证明观察点；无法证明退出时调用方须明确告警。 */
+  readonly onIdleProcessClose?: (outcome: { readonly confirmed: boolean }) => void
 }
 
 export type AcpForkPreDispatchCode = 'ACP_FORK_UNSUPPORTED' | 'ACP_FORK_PRECONDITION_FAILED' | 'ACP_FORK_INTENT_FAILED'
@@ -333,6 +340,20 @@ export class AcpSessionRefreshAbortedError extends Error {
 /** A conforming Agent normally settles cancellation immediately; this only
  * bounds an Agent that ignores `session/cancel`. */
 const ACP_CANCEL_SETTLE_GRACE_MS = 5_000
+
+/**
+ * 闲置回收的缺省窗口（内部有界默认值，不是用户配置项）。
+ * 上游 DSH 没有会话闲置销毁或删除事件，适配器只能自行回收空闲 agent 子进程。
+ */
+const DEFAULT_IDLE_PROCESS_CLOSE_MS = 5 * 60_000
+/** 注入窗口的上限，保证回收窗口始终有界。 */
+const MAX_IDLE_PROCESS_CLOSE_MS = 30 * 60_000
+/** 默认告警通道：无法证明托管范围退出时必须响亮，绝不静默当作成功。 */
+function defaultIdleProcessCloseWarn(): void {
+  console.error(
+    'dsh-acp: idle agent process reclamation could not confirm managed-range exit; process state remains unknown',
+  )
+}
 
 function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true
@@ -546,9 +567,22 @@ export class AcpSessionRuntime {
   private promptToolSnapshots: Map<string, acp.ToolCallUpdate> | undefined
   private readonly cancelGraceMs: number
   private readonly retiredMcpLeases = new Set<AcpMcpLease>()
+  /** 闲置回收窗口与告警通道；与轮次结果上报看门狗（AgentTurn.idleTimer）互不共用。 */
+  private readonly idleProcessCloseMs: number
+  private readonly onIdleProcessClose: (outcome: { readonly confirmed: boolean }) => void
+  private idleProcessTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(private readonly options: AcpSessionRuntimeOptions) {
     this.cancelGraceMs = options.cancelGraceMs ?? ACP_CANCEL_SETTLE_GRACE_MS
+    const injected = options.idleProcessCloseMs ?? DEFAULT_IDLE_PROCESS_CLOSE_MS
+    this.idleProcessCloseMs = Number.isSafeInteger(injected)
+      ? Math.min(MAX_IDLE_PROCESS_CLOSE_MS, Math.max(1, injected))
+      : DEFAULT_IDLE_PROCESS_CLOSE_MS
+    this.onIdleProcessClose =
+      options.onIdleProcessClose ??
+      ((outcome): void => {
+        if (!outcome.confirmed) defaultIdleProcessCloseWarn()
+      })
   }
 
   get acpSessionId(): string | undefined {
@@ -626,6 +660,7 @@ export class AcpSessionRuntime {
   private setHostSettlementPending(pending: boolean): void {
     if (this.hostSettlementPendingValue === pending) return
     this.hostSettlementPendingValue = pending
+    this.refreshIdleProcessWatch()
     try {
       this.options.onHostSettlementChanged?.()
     } catch {
@@ -692,6 +727,70 @@ export class AcpSessionRuntime {
     return await this.connection!.steer(this.sessionId, content, onDispatch)
   }
 
+  // #region 闲置进程回收
+  /**
+   * 真正空闲才允许回收：没有进行中的轮次、待结算宿主操作、待回答审批，也没有
+   * 正在进行的连接/恢复/拆除。单纯的时间经过不构成空闲证明。
+   */
+  private isProcessIdle(): boolean {
+    return (
+      this.connection !== undefined &&
+      !this.connection.isClosed &&
+      this.connectionAbort?.signal.aborted !== true &&
+      this.starting === undefined &&
+      this.closing === undefined &&
+      this.sessionCreation === undefined &&
+      this.restoringSessionId === undefined &&
+      this.cancelledRefreshController === undefined &&
+      this.agentTurnFailure === undefined &&
+      !this.promptClaimed &&
+      !this.promptActive &&
+      !this.wirePromptActive &&
+      !this.awaitingAgentTurn &&
+      this.agentTurns.length === 0 &&
+      this.pendingQuestions === 0 &&
+      !this.hasPendingHostCalls() &&
+      !this.hasUncommittedHostFeedback() &&
+      !this.hostSettlementPendingValue
+    )
+  }
+
+  /** 活动状态变化时重排窗口：活动中不挂定时器，回到空闲才重新计时。 */
+  private refreshIdleProcessWatch(): void {
+    this.cancelIdleProcessWatch()
+    if (!this.isProcessIdle()) return
+    const timer = setTimeout(() => {
+      this.idleProcessTimer = undefined
+      void this.closeIdleProcess()
+    }, this.idleProcessCloseMs)
+    timer.unref?.()
+    this.idleProcessTimer = timer
+  }
+
+  private cancelIdleProcessWatch(): void {
+    if (this.idleProcessTimer !== undefined) {
+      clearTimeout(this.idleProcessTimer)
+      this.idleProcessTimer = undefined
+    }
+  }
+
+  private async closeIdleProcess(): Promise<void> {
+    const connection = this.connection
+    if (connection === undefined || !this.isProcessIdle()) {
+      this.refreshIdleProcessWatch()
+      return
+    }
+    // 拆除复用 AcpAgentProcess.close() 的有界梯子；任何结果都按实际退出证明上报，
+    // close 失败或无法确认范围退出时不冒充成功。
+    try {
+      await this.close()
+    } catch {
+      /* 进程半的 onProcessWarn 已就拆除失败明确告警；此处统一按未证明退出上报。 */
+    }
+    this.onIdleProcessClose({ confirmed: connection.isCleanupConfirmed })
+  }
+  // #endregion
+
   async start(signal?: AbortSignal): Promise<void> {
     await this.initialize(signal)
     if (this.agentTurnFailure !== undefined) return
@@ -700,7 +799,10 @@ export class AcpSessionRuntime {
     try {
       await starting.task
     } finally {
-      if (this.starting === starting) this.starting = undefined
+      if (this.starting === starting) {
+        this.starting = undefined
+        this.refreshIdleProcessWatch()
+      }
     }
   }
 
@@ -720,7 +822,10 @@ export class AcpSessionRuntime {
     try {
       await starting.task
     } finally {
-      if (this.starting === starting) this.starting = undefined
+      if (this.starting === starting) {
+        this.starting = undefined
+        this.refreshIdleProcessWatch()
+      }
     }
   }
 
@@ -822,7 +927,10 @@ export class AcpSessionRuntime {
         }
       }
     } finally {
-      if (this.cancelledRefreshController === refreshController) this.cancelledRefreshController = undefined
+      if (this.cancelledRefreshController === refreshController) {
+        this.cancelledRefreshController = undefined
+        this.refreshIdleProcessWatch()
+      }
     }
   }
 
@@ -868,6 +976,7 @@ export class AcpSessionRuntime {
     } finally {
       this.replayHandler = undefined
       this.restoringSessionId = undefined
+      this.refreshIdleProcessWatch()
     }
   }
 
@@ -946,6 +1055,7 @@ export class AcpSessionRuntime {
     // this ordering, two callers can both pass the initial check and dispatch
     // overlapping RPC prompts while they await the same retained feedback.
     this.promptClaimed = true
+    this.refreshIdleProcessWatch()
     const promptAbort = new AbortController()
     this.promptAbort = promptAbort
     const setupSignal = signal === undefined ? promptAbort.signal : AbortSignal.any([signal, promptAbort.signal])
@@ -1203,6 +1313,7 @@ export class AcpSessionRuntime {
       promptAbort.abort(new Error('ACP prompt lifetime ended'))
       if (this.promptAbort === promptAbort) this.promptAbort = undefined
       this.promptClaimed = false
+      this.refreshIdleProcessWatch()
     }
   }
 
@@ -1257,6 +1368,7 @@ export class AcpSessionRuntime {
   }
 
   private closeInternal(refreshOwner?: AbortController): Promise<void> {
+    this.cancelIdleProcessWatch()
     this.sessionCreationGeneration += 1
     this.sessionCreation?.updates.clear()
     this.sessionCreation = undefined
@@ -1415,6 +1527,7 @@ export class AcpSessionRuntime {
       if (this.sessionCreation === creation) {
         creation.updates.clear()
         this.sessionCreation = undefined
+        this.refreshIdleProcessWatch()
       }
     }
   }
@@ -1489,10 +1602,12 @@ export class AcpSessionRuntime {
               params: acp.RequestPermissionRequest,
             ): Promise<acp.RequestPermissionResponse> => {
               this.pendingQuestions += 1
+              this.refreshIdleProcessWatch()
               try {
                 return await this.handlePermissionRequest(params)
               } finally {
                 this.pendingQuestions -= 1
+                this.refreshIdleProcessWatch()
               }
             },
           }),
@@ -1510,6 +1625,7 @@ export class AcpSessionRuntime {
                   ? undefined
                   : this.promptToolSnapshots?.get(scope.toolCallId)
               this.pendingQuestions += 1
+              this.refreshIdleProcessWatch()
               try {
                 const lease = this.mcpLease
                 const automaticPromise = Promise.resolve(lease?.elicitation?.(params, toolCall))
@@ -1542,6 +1658,7 @@ export class AcpSessionRuntime {
                 )
               } finally {
                 this.pendingQuestions -= 1
+                this.refreshIdleProcessWatch()
               }
             },
           }),
@@ -1571,6 +1688,7 @@ export class AcpSessionRuntime {
       setupSignal.throwIfAborted()
       this.connection = connection
       this.connectionAbort = connectionAbort
+      this.refreshIdleProcessWatch()
     } catch (error) {
       await connection.close().catch(() => undefined)
       await this.mcpLease?.close().catch(() => undefined)
@@ -1707,6 +1825,7 @@ export class AcpSessionRuntime {
   }
 
   private notifyAgentTurnWaiters(): void {
+    this.refreshIdleProcessWatch()
     for (const wake of [...this.agentTurnWaiters]) wake()
   }
 
@@ -2009,6 +2128,7 @@ export class AcpSessionRuntime {
     const pick = (): AgentTurn | undefined => this.agentTurns.find((turn) => turn.listener === undefined)
     const deadline = Date.now() + (this.options.agentTurnWaitMs ?? 5_000)
     this.awaitingAgentTurn = true
+    this.refreshIdleProcessWatch()
     try {
       let turn = pick()
       while (turn === undefined && !signal.aborted && Date.now() < deadline && this.connection?.isClosed !== true) {
@@ -2018,6 +2138,7 @@ export class AcpSessionRuntime {
       return turn
     } finally {
       this.awaitingAgentTurn = false
+      this.refreshIdleProcessWatch()
     }
   }
 
