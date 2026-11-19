@@ -86,6 +86,12 @@ const DEFAULT_PROBE_TIMEOUT_MS = 30_000
 export const DEFAULT_SESSION_SETUP_TIMEOUT_MS = 30_000
 /** 会话写类 RPC 的默认预算（session/set_config_option、session/set_mode）。 */
 export const DEFAULT_SESSION_WRITE_TIMEOUT_MS = 15_000
+/**
+ * 成功的 session/prompt RPC settle 之后，每轮 update 监听器继续保持注册的有界窗口。
+ * 迟到文本（例如通用 ACP Agent 子代理唤醒后的主代理回复）在该窗口内仍进入存活的 DSH 助手流。
+ * 取值需权衡：足够 Agent 在 RPC settle 后冲出回复，又不能因等待下一轮而过长。
+ */
+export const DEFAULT_POST_SETTLE_DRAIN_MS = 120
 
 /** Provenance for a steering failure relative to the JSON-RPC send boundary. */
 export class AcpSteeringRequestError extends Error {
@@ -994,12 +1000,25 @@ export class AcpClientConnection {
     if (onUpdate !== undefined) this.updateListeners.add(onUpdate)
     this.terminalPromptSessionIds.delete(sessionId)
     this.activePromptSessionIds.add(sessionId)
+    let settledResponse: acp.PromptResponse | undefined
     try {
-      return await this.rpc(
+      settledResponse = await this.rpc(
         'session/prompt',
         (agent) => agent.request('session/prompt', { sessionId, prompt }),
         options,
       )
+      // 远端轮次已结束：立即关闭权限/宿主操作边界，避免迟到通知开启新代次；
+      // 只保留 update 监听器一个有界承接窗口，让迟到助手 chunk 仍进入存活的 DSH 助手流。
+      this.activePromptSessionIds.delete(sessionId)
+      this.terminalPromptSessionIds.add(sessionId)
+      const drainMs = options.postSettleDrainMs ?? DEFAULT_POST_SETTLE_DRAIN_MS
+      if (onUpdate !== undefined && drainMs > 0 && !this.isClosed) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, drainMs)
+          timer.unref?.()
+        })
+      }
+      return settledResponse
     } finally {
       this.activePromptSessionIds.delete(sessionId)
       this.terminalPromptSessionIds.add(sessionId)

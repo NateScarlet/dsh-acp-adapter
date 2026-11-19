@@ -124,6 +124,12 @@ export type SessionUpdateListener = (notification: AcpSessionNotification) => vo
 export interface AcpRpcOptions {
   readonly signal?: AbortSignal
   readonly timeoutMs?: number
+  /**
+   * 成功的 session/prompt RPC settle 后，每轮 update 监听器继续保持注册的有界窗口（毫秒），
+   * 使迟到的助手文本（如子代理唤醒回复）仍进入存活的 DSH 助手流。
+   * 缺省为 DEFAULT_POST_SETTLE_DRAIN_MS；设 0 关闭——通过私有协议承接迟到文本的运行时（Qwen 任务）使用。
+   */
+  readonly postSettleDrainMs?: number
 }
 
 /** agent → client 权限请求处理器（审批桥经此接入；缺省 fail closed 回 cancelled）。 */

@@ -44,6 +44,7 @@ import { createAcpTerminalHandlers } from '../../../src/runtime/client-capabilit
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url))
 const MOCK_AGENT_PATH = path.join(TEST_DIR, '..', '..', 'mock-agent', 'mock-agent.ts')
+const LATE_TEXT_AGENT_PATH = path.join(TEST_DIR, '..', '..', 'fixtures', 'late-text-agent.mjs')
 const SPEC_TAG = `--dsh-acp-client-spec-${process.pid}`
 
 const PROMPT_BLOCKS: acp.ContentBlock[] = [{ type: 'text', text: 'Say hello to the mock world.' }]
@@ -131,6 +132,21 @@ function connectInline(script: string, opts: AcpConnectionOptions = {}): AcpClie
     new AcpClientConnection(
       { argv: [process.execPath, '-e', script], cwd: logDir, env: {}, subprocess },
       { eofGraceMs: 120, termGraceMs: 400, ...opts },
+    ),
+  )
+}
+
+// 非 Qwen 夹具：settle session/prompt 之后再发 turn 外文本。
+function connectLateText(env: Record<string, string> = {}, conn: AcpConnectionOptions = {}): AcpClientConnection {
+  return track(
+    new AcpClientConnection(
+      {
+        argv: [process.execPath, LATE_TEXT_AGENT_PATH, `${SPEC_TAG}-late`],
+        cwd: logDir,
+        env,
+        subprocess,
+      },
+      { eofGraceMs: 150, termGraceMs: 500, ...conn },
     ),
   )
 }
@@ -730,6 +746,62 @@ describe('错误分类', () => {
     // 已死进程的 close 立即返回
     await conn.close()
     expect(conn.exited?.code).toBe(1)
+  })
+
+  it('通用 Agent：投递 session/prompt settle 后发出的 turn 外助手文本', async () => {
+    const conn = connectLateText({ LATE_TEXT_LABEL: 'POST-SETTLE-TEXT', LATE_TEXT_DELAY_MS: '20' })
+    await conn.initialize()
+    const session = await conn.newSession()
+    const texts: string[] = []
+    const resp = await conn.prompt(session.sessionId, PROMPT_BLOCKS, (n) => {
+      const u = n.update
+      if (u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') texts.push(u.content.text)
+    })
+    expect(resp.stopReason).toBe('end_turn')
+    // turn 内 chunk 在 RPC 期间投递；迟到 chunk 在 RPC settle 后才到达，仍须进入本轮消费者。
+    expect(texts).toContain('IN-TURN')
+    expect(texts).toContain('POST-SETTLE-TEXT')
+    // drain 不会重复投递 turn 内文本。
+    expect(texts.filter((t) => t === 'IN-TURN')).toHaveLength(1)
+    expect(texts.filter((t) => t === 'POST-SETTLE-TEXT')).toHaveLength(1)
+  })
+
+  it('投递紧跟类子代理完成通知之后的 post-settle 文本', async () => {
+    const conn = connectLateText(
+      { LATE_TEXT_LABEL: 'MAIN-REPLY', LATE_TEXT_DELAY_MS: '20', LATE_TEXT_WITH_SUBAGENT_NOTICE: '1' },
+      {},
+    )
+    await conn.initialize()
+    const session = await conn.newSession()
+    const seen: Array<{ kind: string; text?: string }> = []
+    await conn.prompt(session.sessionId, PROMPT_BLOCKS, (n) => {
+      const u = n.update
+      if (u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text')
+        seen.push({ kind: 'agent_message_chunk', text: u.content.text })
+      if (u.sessionUpdate === 'agent_thought_chunk' && u.content.type === 'text')
+        seen.push({ kind: 'agent_thought_chunk', text: u.content.text })
+    })
+    expect(seen).toContainEqual({ kind: 'agent_thought_chunk', text: 'subagent-finished' })
+    expect(seen).toContainEqual({ kind: 'agent_message_chunk', text: 'MAIN-REPLY' })
+  })
+
+  it('post-settle drain 不泄漏到后续 prompt 轮次', async () => {
+    const conn = connectLateText({ LATE_TEXT_LABEL: 'DRAIN-ONLY', LATE_TEXT_DELAY_MS: '40' })
+    await conn.initialize()
+    const session = await conn.newSession()
+    const firstTexts: string[] = []
+    await conn.prompt(session.sessionId, PROMPT_BLOCKS, (n) => {
+      const u = n.update
+      if (u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') firstTexts.push(u.content.text)
+    })
+    // 第二轮 prompt 的监听器不能收到第一轮迟到文本。
+    const secondTexts: string[] = []
+    await conn.prompt(session.sessionId, PROMPT_BLOCKS, (n) => {
+      const u = n.update
+      if (u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') secondTexts.push(u.content.text)
+    })
+    expect(firstTexts).toContain('DRAIN-ONLY')
+    expect(secondTexts).not.toContain('DRAIN-ONLY')
   })
 
   it.each(['load-fail', 'config-write-fail'])(

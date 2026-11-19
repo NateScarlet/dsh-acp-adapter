@@ -1142,6 +1142,7 @@ export class AcpSessionRuntime {
       }
       const wirePrompt = async (wireContent: acp.ContentBlock[]): Promise<acp.PromptResponse> => {
         this.wirePromptActive = true
+        const isQwen = connection.agentInfo?.name === QWEN_AGENT_NAME
         try {
           return await connection.prompt(
             sessionId,
@@ -1151,13 +1152,14 @@ export class AcpSessionRuntime {
             (notification) => {
               // Qwen's discrete "background task completed" line is task state,
               // not part of the assistant answer.
-              if (connection.agentInfo?.name === QWEN_AGENT_NAME && qwenTaskCompletion(notification) !== undefined)
-                return
+              if (isQwen && qwenTaskCompletion(notification) !== undefined) return
               // Qwen drains its cron queue before answering session/prompt: from
               // the echoed scheduled prompt on, the stream belongs to that turn.
               if (notification.sessionId === sessionId && this.liveAgentTurn()?.announced === false) return
               deliver(notification)
             },
+            // Qwen 通过私有轮次采纳路径承接迟到文本；通用 drain 会重复投递同一 chunk，故对其关闭。
+            isQwen ? { postSettleDrainMs: 0 } : {},
           )
         } finally {
           this.wirePromptActive = false
