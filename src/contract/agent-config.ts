@@ -8,7 +8,7 @@
 export const ACP_SETTINGS_NS = 'dsh-acp-adapter'
 
 /** LLM route id prefix; agent `<id>` routes as `acp-<id>`. */
-export const ACP_ROUTE_PREFIX = 'acp-'
+const ACP_ROUTE_PREFIX = 'acp-'
 
 /**
  * Agent ids double as settings path segments, health-endpoint URL segments,
@@ -44,10 +44,10 @@ export interface AcpStubAgentConfig {
   env: Record<string, string>
   /** Login guidance shown when a probe fails with auth_required. */
   loginHint?: string
-  /** Explicit specialized runtime; the original four built-in profile IDs remain a fallback.
+  /** Explicit specialized runtime; the original supported built-in profile IDs remain a fallback.
    * Catalog metadata never grants runtime behavior. Unknown profiles use generic ACP.
    */
-  runtime?: AcpAgentId
+  runtime?: AcpConfiguredRuntime
   /** Registry identity for display metadata only; never grants runtime behavior. */
   catalogId?: string
 }
@@ -55,35 +55,81 @@ export interface AcpStubAgentConfig {
 /** One ACP agent's stored configuration (the `dsh-acp-adapter` settings per-id value). */
 export type AcpAgentConfig = AcpStubAgentConfig
 
+/** Identity of a probe result. Labels, login guidance and environment ordering do not change the launch. */
+export function acpProbeConfigKey<
+  C extends Pick<AcpStubAgentConfig, 'command' | 'args' | 'env'> & { readonly runtime?: AcpConfiguredRuntime },
+>(config: C): string {
+  const envKeys = Object.keys(config.env).sort()
+  const envHashes = Object.entries(config.env)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => [key, shortSecretHash(value)])
+  return JSON.stringify({
+    command: config.command,
+    args: config.args,
+    envKeys,
+    envHashes,
+    runtime: config.runtime ?? null,
+  })
+}
+
+/** Deterministic short hash for cache identity; never returns the secret itself. */
+function shortSecretHash(value: string): string {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
 // Runtime identities are shared; their trusted execution behavior stays host-side.
 
 /** Explicitly supported ACP backend identity bindings. */
-export type AcpAgentId = 'devin' | 'codex' | 'kimi' | 'claude' | 'codebuddy' | 'antigravity'
+export type AcpAgentId = 'devin' | 'codex' | 'claude' | 'codebuddy' | 'antigravity'
+
+/** Read compatibility only: a retired binding remains unavailable until explicitly removed. */
+export type AcpConfiguredRuntime = AcpAgentId | 'kimi'
 
 /** 所有可显式绑定的合法 runtime（settings schema 使用）。 */
-export const ACP_AGENT_IDS: readonly AcpAgentId[] = ['devin', 'codex', 'kimi', 'claude', 'codebuddy', 'antigravity']
+export const ACP_AGENT_IDS: readonly AcpAgentId[] = ['devin', 'codex', 'claude', 'codebuddy', 'antigravity']
 
-/** Profile-ID fallback predates explicit runtime bindings and is limited to the original four IDs. */
-const LEGACY_RUNTIME_IDS: readonly AcpAgentId[] = ['devin', 'codex', 'kimi', 'claude']
+/** Profile-ID fallback predates explicit runtime bindings and is limited to the original supported IDs. */
+const LEGACY_RUNTIME_IDS: readonly AcpAgentId[] = ['devin', 'codex', 'claude']
 
-export const RUNTIME_REGISTRY_IDS: Readonly<Record<AcpAgentId, string>> = {
+const RUNTIME_REGISTRY_IDS: Readonly<Record<AcpAgentId, string>> = {
   devin: 'devin',
   codex: 'codex-acp',
-  kimi: 'kimi',
   claude: 'claude-acp',
   codebuddy: 'codebuddy-code',
   antigravity: 'antigravity-acp',
 }
 
 /** Explicit binding wins; only the original built-in profile IDs retain legacy fallback. */
-export function effectiveRuntimeOf(id: string, config?: { readonly runtime?: AcpAgentId }): AcpAgentId | undefined {
-  return config?.runtime ?? (LEGACY_RUNTIME_IDS.includes(id as AcpAgentId) ? (id as AcpAgentId) : undefined)
+export function effectiveRuntimeOf(
+  id: string,
+  config?: { readonly runtime?: AcpConfiguredRuntime },
+): AcpAgentId | undefined {
+  if (retiredAgentReason(id, config) !== undefined) return undefined
+  return (
+    (config?.runtime as AcpAgentId | undefined) ??
+    (LEGACY_RUNTIME_IDS.includes(id as AcpAgentId) ? (id as AcpAgentId) : undefined)
+  )
+}
+
+/** Retained settings are never silently rebound to generic ACP or launched. */
+export function retiredAgentReason(
+  id: string,
+  config?: { readonly runtime?: AcpConfiguredRuntime },
+): string | undefined {
+  return config?.runtime === 'kimi' || (config?.runtime === undefined && id === 'kimi')
+    ? 'Kimi support has been removed. This saved configuration and its history are retained; remove the configuration explicitly when no longer needed.'
+    : undefined
 }
 
 /** Catalog metadata does not participate in execution identity. */
 export function catalogIdOf(
   id: string,
-  config: { readonly runtime?: AcpAgentId; readonly catalogId?: string },
+  config: { readonly runtime?: AcpConfiguredRuntime; readonly catalogId?: string },
 ): string {
   const runtime = effectiveRuntimeOf(id, config)
   return config.catalogId ?? (runtime === undefined ? id : RUNTIME_REGISTRY_IDS[runtime])

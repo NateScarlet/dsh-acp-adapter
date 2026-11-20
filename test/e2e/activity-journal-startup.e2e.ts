@@ -4,9 +4,10 @@ import { expect, it, vi } from 'vitest'
 import { launchBrowser, newEnglishPage } from './browser.ts'
 import { connectFreshWorkspace, writeComposerDraft } from '#host-support'
 import { launchAdapterWorld } from './scaffold.ts'
-import type { AcpRemoteService } from '../../src/remote/service.js'
+import { openNativeSettings } from './plugin-panel.helpers.ts'
+import type { AcpRemoteService, AcpRemoteServiceDeps } from '../../src/remote/service.js'
 
-it('keeps the activity area quiet while the initial ACP binding is committed', async () => {
+it.each(['en', 'zh'] as const)('keeps %s activity quiet while the initial ACP binding is committed', async (locale) => {
   const host = await launchAdapterWorld()
   const browser = await launchBrowser({ headless: true })
   const page = await newEnglishPage(browser)
@@ -37,23 +38,29 @@ it('keeps the activity area quiet while the initial ACP binding is committed', a
   })
   await host.ctx.agentDefaultModel.saveSelection({ provider: 'acp-codex', model: 'mock-model-a' })
 
-  // Count real remote failures, without injecting an artificial failure. The
-  // workspace-only session/new gate keeps the durable binding pending while
-  // catalog probing and the rest of the Host continue normally.
+  // Hold the real first binding pending. In the Chinese run, also fail its first
+  // ownership read once to exercise the shipped RPC mapping and client retry.
   const service = host.ctx.get('dshAcp') as AcpRemoteService
+  const gates = (
+    service as unknown as { resolved: { activityReadStatus: NonNullable<AcpRemoteServiceDeps['activityReadStatus']> } }
+  ).resolved
+  const firstRead =
+    locale === 'zh'
+      ? vi.spyOn(gates, 'activityReadStatus').mockImplementationOnce(async () => {
+          throw new Error('temporary binding read failure')
+        })
+      : undefined
   const follow = service.activityFollow.bind(service)
   let pendingReads = 0
+  let failedOwnerReads = 0
   const observedFollow = vi.spyOn(service, 'activityFollow').mockImplementation(async function* (...args) {
     try {
       yield* follow(...args)
     } catch (error) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        error.code === 'dsh-acp/activity-binding-pending'
-      )
-        pendingReads++
+      if (typeof error === 'object' && error !== null && 'code' in error) {
+        if (error.code === 'dsh-acp/activity-binding-pending') pendingReads++
+        if (error.code === 'dsh-acp/activity-owner-unavailable') failedOwnerReads++
+      }
       throw error
     }
   })
@@ -61,20 +68,31 @@ it('keeps the activity area quiet while the initial ACP binding is committed', a
   try {
     await page.goto(host.authenticatedUrl)
     await connectFreshWorkspace(page, host.workspaceCwd, 'activity-startup')
+    if (locale === 'zh') {
+      const settings = await openNativeSettings(page)
+      await settings.getByRole('button', { name: 'General', exact: true }).click()
+      await settings.getByRole('button', { name: 'English', exact: true }).click()
+      await page.getByRole('menuitem', { name: '中文', exact: true }).click()
+      await page
+        .getByRole('dialog', { name: '设置', exact: true })
+        .getByRole('button', { name: '关闭', exact: true })
+        .click()
+    }
     await page.evaluate(() => {
       const target = window as typeof window & { startupActivityHints?: string[] }
       target.startupActivityHints = []
       const capture = () => {
         for (const element of document.querySelectorAll('[data-acp-activity]')) {
           const text = element.textContent ?? ''
-          if (/reconnecting|unavailable|retrying/i.test(text)) target.startupActivityHints!.push(text)
+          if (/reconnecting|unavailable|retrying|重新连接|不可用|重试/i.test(text))
+            target.startupActivityHints!.push(text)
         }
       }
       new MutationObserver(capture).observe(document.body, { subtree: true, childList: true, characterData: true })
     })
     const composer = page.locator('[data-composer-input]').first()
     await writeComposerDraft(page, composer, 'E2E_RENDER_STREAM')
-    const send = page.getByRole('button', { name: 'Send message', exact: true })
+    const send = page.getByRole('button', { name: locale === 'en' ? 'Send message' : '发送消息', exact: true })
     await expect.poll(() => send.isEnabled()).toBe(true)
     const settled = host.whenTurnSettled(30_000)
     void settled.catch(() => {})
@@ -89,6 +107,7 @@ it('keeps the activity area quiet while the initial ACP binding is committed', a
       )
       .toBe(true)
     await expect.poll(() => pendingReads).toBeGreaterThanOrEqual(2)
+    expect(failedOwnerReads).toBe(locale === 'zh' ? 1 : 0)
     expect(
       await page.evaluate(() => (window as typeof window & { startupActivityHints?: string[] }).startupActivityHints),
     ).toEqual([])
@@ -98,7 +117,13 @@ it('keeps the activity area quiet while the initial ACP binding is committed', a
     expect(
       await page.evaluate(() => (window as typeof window & { startupActivityHints?: string[] }).startupActivityHints),
     ).toEqual([])
-    expect(await page.getByText('Agent activity is temporarily unavailable.', { exact: true }).count()).toBe(0)
+    expect(
+      await page
+        .getByText(locale === 'en' ? 'Agent activity is temporarily unavailable.' : 'Agent 活动暂时不可用。', {
+          exact: true,
+        })
+        .count(),
+    ).toBe(0)
     const responseBlock = page.locator('[data-chat-flow-kind="assistant-step"]:not([hidden]) [data-streaming]')
     const renderedResponse = () => responseBlock.evaluateAll((elements) => elements.at(-1)?.textContent?.trim() ?? null)
     let expectedResponse = 'E2E_RENDER_READY'
@@ -107,12 +132,19 @@ it('keeps the activity area quiet while the initial ACP binding is committed', a
     for (let index = 0; index < 5; index += 1) {
       expectedResponse += `E2E_RENDER_CHUNK_${index}`
       await expect.poll(renderedResponse).toBe(expectedResponse)
-      expect(await page.getByText('Agent activity is temporarily unavailable.', { exact: true }).count()).toBe(0)
+      expect(
+        await page
+          .getByText(locale === 'en' ? 'Agent activity is temporarily unavailable.' : 'Agent 活动暂时不可用。', {
+            exact: true,
+          })
+          .count(),
+      ).toBe(0)
       await writeFile(join(gateDirectory, `continue-${index}`), 'continue')
     }
     await settled
   } finally {
     observedFollow.mockRestore()
+    firstRead?.mockRestore()
     await writeFile(join(bindingGate, 'continue'), 'cleanup')
     await page.close()
     await browser.close()

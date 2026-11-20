@@ -1,3 +1,4 @@
+import { isDirectChild, treeRoots } from './subagent-tree.ts'
 /** Published Loader + real ACP subprocess + native browser UI; no model credentials. */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
@@ -18,6 +19,7 @@ import { acpPermissionAudit } from './acp-permission-audit.ts'
 const before = process.env.DSH_E2E_PARENT_APPROVAL_BASELINE === '1'
 const directory =
   process.env.DSH_E2E_PARENT_APPROVAL_EVIDENCE_DIRECTORY ??
+  process.env.DSH_E2E_EVIDENCE_DIR ??
   join(root, '.local/parent-approval-20261021', before ? 'before' : 'after')
 mkdirSync(directory, { recursive: true })
 
@@ -50,7 +52,7 @@ class NativeParent extends LlmAdapter {
 async function fixture(parentKind: 'native' | 'acp' = 'native', locale: 'en' | 'zh' = 'en') {
   const host = await launchAdapterWorld({
     adapterDirectory: process.env.DSH_E2E_ADAPTER_DIRECTORY ?? root,
-    toolsMode: 'native',
+    toolExecutor: 'native',
   })
   const browser = await launchBrowser({ headless: true })
   const page = await newEnglishPage(browser)
@@ -152,7 +154,7 @@ async function fixture(parentKind: 'native' | 'acp' = 'native', locale: 'en' | '
     const ready = host.whenTurnSettled(30_000)
     await page.getByRole('button', { name: locale === 'zh' ? '发送消息' : 'Send message', exact: true }).click()
     const parent = required(host.ctx.agents.get(await ready))
-    expect(host.ctx.get('agentTeams', false)).toBeUndefined()
+    expect(host.ctx.agentTeams.isEnabled(parent)).toBe(false)
     const url = page.url()
     const marker = (key: string) => join(required(parent.session.header.cwd), parentPermissionMarker(key))
     const effects = (key: string): { key: string; sessionId: string; optionId: string }[] =>
@@ -164,29 +166,31 @@ async function fixture(parentKind: 'native' | 'acp' = 'native', locale: 'en' | '
             .map((line) => JSON.parse(line))
         : []
     const spawn = async (key: string, owner = parent, native = false) => {
+      const name = native ? 'review-parent' : `permission-${key}`
       const activation = await host.ctx.subagents.startActivation({
         provider: 'spawn',
+        name,
         label: native ? 'Nested direct parent' : `Permission worker ${key}`,
         delivery: 'caller',
-        request: {
-          parent: owner,
-          prompt: [{ type: 'text', text: native ? 'E2E_HOLD_NATIVE_MIDDLE' : `E2E_PARENT_PERMISSION_OPTIONS:${key}` }],
-          agentOptions: {
-            provider: native ? 'parent-native' : 'acp-parent-options',
-            model: native ? 'fixture' : 'mock-model-a',
-          },
+        parent: owner,
+        prompt: [{ type: 'text', text: native ? 'E2E_HOLD_NATIVE_MIDDLE' : `E2E_PARENT_PERMISSION_OPTIONS:${key}` }],
+        agentOptions: {
+          provider: native ? 'parent-native' : 'acp-parent-options',
+          model: native ? 'fixture' : 'mock-model-a',
         },
         signal: new AbortController().signal,
       })
       activations.push(activation)
       const child = required(host.ctx.agents.get(activation.childId))
+      const parentName = host.ctx.subagents.namesOf(owner).self
+      expect(host.ctx.subagents.namesOf(child).self).toBe(parentName === 'lead' ? name : `${parentName}/${name}`)
       children.push(child)
       return { activation, child }
     }
     const card = (key: string): Locator =>
       page.locator('section[data-question-key]').filter({ hasText: parentPermissionMarker(key) })
     const save = async (name: string, details: unknown = {}) => {
-      await page.screenshot({ path: join(directory, `${name}.png`), fullPage: true })
+      await page.screenshot({ path: join(directory, `${name}.png`), fullPage: true, animations: 'disabled' })
       writeFileSync(
         join(directory, `${name}.json`),
         JSON.stringify(
@@ -284,8 +288,11 @@ async function assertChoices(
   for (const option of PARENT_PERMISSION_OPTIONS)
     expect(await card.getByRole('radio', { name: option.name, exact: true }).count()).toBe(1)
   const source = await card.locator('[data-question-source]').innerText()
+  expect(world.ctx.subagents.rootOf(child)).toBe(world.parent)
+  const childName = required(world.ctx.subagents.namesOf(child).self.split('/').at(-1))
+  expect(childName).toBe(`permission-${key}`)
   expect(source).toContain(child.id.slice(0, 8))
-  expect(source).toContain(`Permission worker ${key}`)
+  expect(source).toContain(`${childName} · ${child.id.slice(0, 8)}`)
   expect(await card.locator('[data-question-operation]').innerText()).toContain(expectedOperation)
   expect(world.effects(key)).toEqual([])
   expect(world.ctx.approval.overrideOf(child.session)).toBe('never')
@@ -525,11 +532,15 @@ it.each([
   90_000,
 )
 
-it.each(['file-write', 'long-scope'] as const)(
-  'keeps the complete %s operation available before choosing an authorization scope',
-  async (shape) => {
-    const world = await fixture()
-    const key = `${shape}-review`
+it.each([
+  { shape: 'file-write', locale: 'en' },
+  { shape: 'file-write', locale: 'zh' },
+  { shape: 'long-scope', locale: 'en' },
+] as const)(
+  'keeps the complete $shape operation available before choosing an authorization scope in $locale',
+  async ({ shape, locale }) => {
+    const world = await fixture('native', locale)
+    const key = `${shape}-review-${locale}`
     try {
       const { activation, child } = await world.spawn(key)
       if (before) {
@@ -545,11 +556,28 @@ it.each(['file-write', 'long-scope'] as const)(
       expect(await card.locator('[data-question-detail]').count()).toBe(0)
       expect(text).toContain(world.marker(key))
       if (shape === 'file-write') {
-        expect(text).toContain('write')
-        expect(text).toContain('Content: A short review marker.')
-        expect(text).toContain(`File path: ${world.marker(key)}`)
-        expect(text).not.toContain('Input: {')
-        await saveOptions(world, key, `${key}-default-wide`)
+        expect(text.split('\n')[0]).toBe(locale === 'zh' ? '编辑文件' : 'Edit file')
+        expect(text).toContain(locale === 'zh' ? '内容 (120 行)' : 'Content (120 lines)')
+        expect(text).toContain(`${locale === 'zh' ? '文件路径' : 'File path'}: ${world.marker(key)}`)
+        expect(text).toContain('review line 1')
+        expect(text).toContain(locale === 'zh' ? '如果文件已存在，将覆盖原文件。' : 'Overwrite the file if it exists.')
+        expect(text).not.toContain('"overwrite"')
+        expect(text).not.toContain('review line 120')
+        for (const width of [1600, 390]) {
+          await world.page.setViewportSize({ width, height: width === 390 ? 844 : 1000 })
+          if (width === 390) await world.page.locator('[data-sidebar-collapsed="true"]').waitFor()
+          await details.click({ trial: true })
+          await world.save(`${key}-folded-${width}`)
+          await details.click()
+          const detail = card.locator('[data-question-detail]')
+          await detail.waitFor()
+          const expanded = await detail.innerText()
+          expect(expanded.split('review line 120')).toHaveLength(2)
+          expect(expanded).toContain('"overwrite": true')
+          expect(await world.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+          await world.save(`${key}-expanded-${width}`)
+          await details.click()
+        }
       } else {
         expect(text).toContain('review-permission-context '.repeat(120))
         expect(text).toContain('ACP_LONG_COMMAND_END')
@@ -748,10 +776,10 @@ it('presents a nested child at the true root while retaining its direct parent a
   const world = await fixture()
   try {
     const middle = await world.spawn('middle', world.parent, true)
-    expect(world.ctx.agents.isOwnedBy(middle.child.id, world.parent)).toBe(true)
+    expect(isDirectChild(world.ctx, middle.child.id, world.parent)).toBe(true)
     const leaf = await world.spawn('nested', middle.child)
-    expect(world.ctx.agents.isOwnedBy(leaf.child.id, middle.child)).toBe(true)
-    expect(world.ctx.agents.roots()).not.toContain(middle.child)
+    expect(isDirectChild(world.ctx, leaf.child.id, middle.child)).toBe(true)
+    expect(treeRoots(world.ctx)).not.toContain(middle.child)
     if (before) {
       await assertOldBoundary(world, leaf.activation, 'nested')
       await world.save('nested-baseline')
@@ -759,8 +787,11 @@ it('presents a nested child at the true root while retaining its direct parent a
     }
     const card = await assertChoices(world, 'nested', leaf.child)
     const source = await card.locator('[data-question-source]').innerText()
+    expect(world.ctx.subagents.namesOf(middle.child).self).toBe('review-parent')
+    expect(world.ctx.subagents.namesOf(leaf.child).self).toBe('review-parent/permission-nested')
     expect(source).toContain(middle.child.id.slice(0, 8))
-    expect(source).toContain('Nested direct parent')
+    expect(source).toContain(`review-parent · ${middle.child.id.slice(0, 8)}`)
+    expect(source.indexOf('review-parent')).toBeLessThan(source.indexOf(' → permission-nested'))
     expect(
       world.questions
         .filter((entry) => JSON.stringify(entry.questions).includes('External ACP marker nested'))

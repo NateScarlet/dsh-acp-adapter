@@ -15,6 +15,7 @@ function response(
     route?: 'acp' | 'native'
     committed?: boolean
     synthetic?: boolean
+    historicalLookup?: true
   } = {},
 ) {
   const activity: AcpActivityNodeData = {
@@ -24,6 +25,7 @@ function response(
     agentSessionId: 'remote',
     committedActivitySeq: step,
     settled: true,
+    ...(options.historicalLookup ? { historicalLookup: true } : {}),
   }
   const finalNode = {
     kind: 'assistant',
@@ -66,6 +68,29 @@ const replies = (nodes: readonly ChatConversationViewNode[]) =>
   nodes.filter((node): node is ChatNode<'assistant-step'> => node.kind === 'assistant-step')
 
 describe('committed ACP replies across native automatic follow-up steps', () => {
+  it('keeps a foreign interrupted answer native until the original session and input own activity', () => {
+    const { node, activity } = response(1, [thought('Original'), text('Stopped')], { historicalLookup: true })
+    const row = {
+      kind: 'tool',
+      activityId: 'original-tool',
+      activitySeq: 1,
+      revisionSeq: 1,
+      status: 'completed',
+      presentation: 'Inspect',
+      time: 1,
+      dshSessionId: 'session',
+      ownerDshSessionId: 'session',
+      promptAnchorMessageId: 'input-1',
+    } as const
+    const windows = new Map<string, ActivityWindow>([
+      [activityWindowKey({ ...activity, ownerDshSessionId: 'foreign' }), { unavailable: false, rows: [row] }],
+      [activityWindowKey({ ...activity, promptAnchorMessageId: 'another-input' }), { unavailable: false, rows: [row] }],
+      [activityWindowKey(activity), { unavailable: false, rows: [] }],
+    ])
+    expect(normalizeAcpChatNodes([node], windows)).toEqual([node])
+    windows.set(activityWindowKey(activity), { unavailable: false, rows: [row] })
+    expect(normalizeAcpChatNodes([node], windows).filter((entry) => entry.kind === 'tool-call')).toHaveLength(1)
+  })
   it.each([
     ['Main report with [file](./report.html).', 'No new information.'],
     ['OK', 'A long correction. '.repeat(30)],
@@ -80,10 +105,11 @@ describe('committed ACP replies across native automatic follow-up steps', () => 
       data: { turn: 1, answerStep: 2, answerAnchorSeq: 20, inlineReasoning: true, toolCallCount: 0 },
     } as ChatConversationViewNode
     const result = normalizeAcpChatNodes([process, report.node, receipt.node], new Map())
-    const visible = replies(result).filter((node) => node.groupTree === 'turn')
-    expect(visible.map((node) => node.data.blocks)).toEqual([[text(first!)], [text(second!)]])
-    expect(visible.map((node) => node.key)).toEqual(['reply-1', 'reply-2'])
-    expect(visible.map((node) => node.data.finalNode?.messageId)).toEqual(['reply-1', 'reply-2'])
+    const committed = replies(result).filter((node) => node.data.finalNode?.messageId !== undefined)
+    expect(committed.map((node) => node.data.blocks)).toEqual([[text(first!)], [text(second!)]])
+    expect(committed.map((node) => node.key)).toEqual(['reply-1', 'reply-2'])
+    expect(committed.map((node) => node.data.finalNode?.messageId)).toEqual(['reply-1', 'reply-2'])
+    expect(committed.every((node) => node.groupTree === undefined)).toBe(true)
     expect(
       replies(result)
         .filter((node) => node.data.blocks.some((block) => block.kind === 'reasoning'))
@@ -125,7 +151,10 @@ describe('committed ACP replies across native automatic follow-up steps', () => 
               : [],
         })
       const result = normalizeAcpChatNodes([node, marker], windows)
-      expect(result.find((item) => item.key === node.key)?.groupTree).toBe('turn')
+      expect(result.find((item) => item.key === node.key)).toMatchObject({
+        data: { blocks: [text('Committed report')], finalNode: { messageId: 'reply-1' } },
+      })
+      expect(result.find((item) => item.key === node.key)?.groupTree).toBeUndefined()
       expect(result.some((item) => item.key === marker.key)).toBe(state === 'not loaded' || state === 'unavailable')
       expect(result.filter((item) => item.kind === 'tool-call').every((item) => item.groupTree === undefined)).toBe(
         true,
@@ -133,29 +162,25 @@ describe('committed ACP replies across native automatic follow-up steps', () => 
     },
   )
 
-  it.each(['native', 'streaming', 'synthetic interruption'] as const)(
-    'does not promote %s to a committed ACP reply',
-    (kind) => {
-      const { node, activity } = response(1, [thought('Process'), text('Text')], {
-        route: kind === 'native' ? 'native' : 'acp',
-        committed: kind !== 'streaming',
-        synthetic: kind === 'synthetic interruption',
-      })
-      const result = normalizeAcpChatNodes(
-        [node],
-        new Map([[activityWindowKey(activity), { rows: [], unavailable: false }]]),
-      )
-      expect(result.every((item) => item.groupTree === undefined)).toBe(true)
-    },
-  )
+  it.each(['native', 'streaming', 'synthetic interruption'] as const)('preserves native placement for %s', (kind) => {
+    const { node, activity } = response(1, [thought('Process'), text('Text')], {
+      route: kind === 'native' ? 'native' : 'acp',
+      committed: kind !== 'streaming',
+      synthetic: kind === 'synthetic interruption',
+    })
+    const result = normalizeAcpChatNodes(
+      [node],
+      new Map([[activityWindowKey(activity), { rows: [], unavailable: false }]]),
+    )
+    expect(result.every((item) => item.groupTree === undefined)).toBe(true)
+  })
 
-  it('does not expose reasoning-only responses or trailing reasoning with a preserved reply', () => {
+  it('keeps reasoning-only responses and trailing reasoning separate from reply content', () => {
     const report = response(1, [text('Report'), thought('Trailing private reasoning')])
     const empty = response(2, [thought('No reply')])
     const result = replies(normalizeAcpChatNodes([report.node, empty.node], new Map()))
-    expect(result.filter((node) => node.groupTree === 'turn').map((node) => node.data.blocks)).toEqual([
-      [text('Report')],
-    ])
+    expect(result.find((node) => node.key === report.node.key)?.data.blocks).toEqual([text('Report')])
+    expect(result.every((node) => node.groupTree === undefined)).toBe(true)
     expect(result.find((node) => node.key === report.node.key)?.data.finalNode?.messageId).toBe('reply-1')
     expect(result.filter((node) => node.data.finalNode?.messageId === 'reply-1')).toHaveLength(1)
   })
@@ -219,20 +244,26 @@ describe('committed ACP replies across native automatic follow-up steps', () => 
       expect(owner.key).toBe(scenario === 'reasoning only' ? `${node.key}:content:0` : node.key)
       expect(owner.data.finalNode?.interrupted).toBe(true)
       if (scenario === 'reply then reasoning') {
-        expect(owner.groupTree).toBe('turn')
         expect(owner.data.blocks).toEqual([text('Partial reply')])
-      } else expect(owner.groupTree).toBeUndefined()
+      }
+      expect(owner.groupTree).toBeUndefined()
     },
   )
 
-  it('retains only the last reply segment inside a committed ACP prompt', () => {
+  it('retains each segment while assigning the native final record only to the last reply', () => {
     const { node, activity } = response(1, [text('Intermediate progress'), thought('Work'), text('Report')])
     const result = replies(
       normalizeAcpChatNodes([node], new Map([[activityWindowKey(activity), { rows: [], unavailable: false }]])),
     )
-    expect(result.filter((node) => node.groupTree === 'turn').map((node) => node.data.blocks)).toEqual([
+    expect(result.map((node) => node.data.blocks)).toEqual([
+      [text('Intermediate progress')],
+      [thought('Work')],
       [text('Report')],
     ])
+    expect(result.filter((node) => node.data.finalNode !== undefined).map((node) => node.data.blocks)).toEqual([
+      [text('Report')],
+    ])
+    expect(result.every((node) => node.groupTree === undefined)).toBe(true)
     expect(
       result.find((node) =>
         node.data.blocks.some((block) => block.kind === 'text' && block.text === 'Intermediate progress'),
@@ -275,21 +306,23 @@ describe('committed ACP replies across native automatic follow-up steps', () => 
     )
     expect(
       replies(result)
-        .filter((node) => node.groupTree === 'turn')
+        .filter((node) => node.data.finalNode !== undefined)
         .map((node) => node.key),
     ).toEqual(['reply-1', 'reply-2'])
     expect(result.filter((node) => node.kind === 'acp-activity')).toEqual([marker])
     expect(result.some((node) => node.kind === 'tool-call')).toBe(false)
   })
 
-  it('does not reuse a formerly folded seat after its public placement changes', () => {
+  it('preserves native placement and stable cached seats as a live response settles', () => {
     const { node, activity } = response(1, [text('Report')])
     const windows = new Map([[activityWindowKey(activity), { rows: [], unavailable: false }]])
     const folded = normalizeAcpChatNodes([response(1, [text('Report')], { committed: false }).node], windows)
     const cache = new Map<string, AcpNormalizationCacheEntry>()
     const cold = normalizeAcpChatNodes([node], windows, cache, new Map(folded.map((item) => [item.key, item])))
     const warm = normalizeAcpChatNodes([node], windows, cache, new Map(cold.map((item) => [item.key, item])))
-    expect(cold[0]?.groupTree).toBe('turn')
+    expect(cold[0]?.groupTree).toBeUndefined()
+    expect(cold[0]?.key).toBe(folded[0]?.key)
+    expect((cold[0] as ChatNode<'assistant-step'>).data.finalNode?.messageId).toBe('reply-1')
     expect(warm[0]).toBe(cold[0])
     expect(normalizeAcpChatNodes([node], windows)[0]).toEqual(cold[0])
   })

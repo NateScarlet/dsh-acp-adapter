@@ -24,8 +24,7 @@ import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import type * as acp from '@agentclientprotocol/sdk'
 import { AcpProfileAdapter, type AcpProfileRuntime } from '../../../src/host/composition/profile-adapter.ts'
-import { acpSessionView } from '../../../src/host/composition/session-facts.ts'
-import { installAcpExecutionProjection } from '../../support/session-facts.ts'
+import { AcpSessionFacts, acpSessionView } from '../../../src/host/composition/session-facts.ts'
 import { createAcpSidecar } from '../../../src/persistence/sidecar.ts'
 
 // Resolve the published plugins from the exact CLI dependency graph so this
@@ -64,7 +63,7 @@ async function harness(scenario: string) {
   await ctx.plugin(AgentLoop, { agents: [] })
   // Pin the published default: automatic compaction enabled.
   await ctx.plugin(compactionModule.default, { auto: true })
-  await installAcpExecutionProjection(ctx)
+  await ctx.plugin(AcpSessionFacts)
 
   const prompts: string[] = []
   const runtime: AcpProfileRuntime = {

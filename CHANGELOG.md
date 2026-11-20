@@ -1,28 +1,122 @@
 # 更新记录 / Changelog
 
-用户可见的变化与升级提示。发布时间、精确安装方式及校验值见 [GitHub Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases)。历史条目根据对应标签的代码差异补录；不代表重新发布了 npm 包。
+安装命令、发布日期及安装包校验值见 [GitHub Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases)。
 
-User-facing changes and upgrade notes. See [GitHub Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases) for publication dates, exact installation instructions, and checksums. Historical entries were reconstructed from tag diffs; npm packages were not republished.
+Find installation commands, release dates, and package checksums on [GitHub Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases).
 
-## 0.2.2-rc.1.1
+## 0.2.2-rc.5.2
 
 ### 中文
 
-- 修复在已有对话的 ACP 会话内切换同一 profile 的模型被 `MODEL_SWITCH_COMPACTION_FAILED` 拒绝的问题：ACP 路由的精确模型元数据声明默认 1M 上下文容量，切换后继续沿用原 ACP 会话，旧历史保留，无需重建会话或绑定。
-- 升级兼容目标及精确官方依赖至 DSH `0.2.2-rc.1`，同步 Cordis 4.1 与 Node.js `>=24.9`。安装本版前请升级宿主，无需新增用户配置。
-- 适配新的批次工具执行接口：单次 ACP 调用按批次执行，并按当前轮次解析宿主工具准入，使按步骤启用的工具（如 Web 搜索与抓取）在 ACP 会话中继续可用；PTC 的 `run_code` 传输保持可用。
-- 适配异步会话投影注册：启动时等待注册完成并保留读取句柄。模型选择的读取与写入改用 Agent 模型接口，团队成员在创建时记录其绑定范围内保存的模型。
-- 保留 HMR 重注册同名工具时活动轮次的工具连接，仅在真实撤权、工具移除或定义变化时立即关闭；轮次结束后释放不再有效的连接。
-- 迁移测试与工具夹具到新的执行器、测试工具包与投影接口，并保持既有审批、团队与诊断覆盖。
+- 停止回复并删除 Agent 后，重开原对话仍可查看该轮的工具调用。新会话首次读取活动记录遇到临时错误时会自动重试。
+- 文件编辑审批会显示目标路径、覆盖提示和简短预览，展开详情可查看完整变更。
+- 修改 Agent 的启动命令、参数、环境变量或运行时后，插件会自动重新检查连接。
+- 同一 ACP 连接续聊时会省略已经送达的工具桥说明和技能目录。目录撤销时会通知 Agent，重连后会重新同步。感谢 lukstei 提供复现和参考实现。
 
 ### English
 
-- Fix model switches inside one profile being rejected with `MODEL_SWITCH_COMPACTION_FAILED` in existing ACP sessions: the ACP route's exact model metadata now declares the default 1M context capacity, and the switch keeps using the original ACP session with its history instead of rebuilding the session or binding.
-- Target DSH `0.2.2-rc.1` with exact published dependencies, Cordis 4.1 and Node.js `>=24.9`. Upgrade the host before installing this version; no additional user configuration is required.
-- Adapt to the batch tool-execution interface: one ACP call runs as a batch and resolves host tool admission for the current turn, so step-conditional tools such as Web search and fetch remain available in ACP sessions while the PTC `run_code` transport keeps working.
-- Adapt to asynchronous session-projection registration: activation awaits registration and retains its read handle. Model selection reads and writes use the Agent model API, and teammates record their binding-scoped saved model at creation.
-- Keep the tool connection for an active turn when HMR re-registers same-named tools, closing immediately only on real revocation, tool removal or definition changes; stale connections are released when the turn ends.
-- Migrate tests and tool fixtures to the new executors, test kit and projection interfaces while preserving approval, Teams and diagnostic coverage.
+- Tool calls remain visible when you reopen a stopped reply after removing its Agent. New sessions automatically retry temporary errors while loading Agent activity.
+- File edit approvals show the target path, overwrite behavior, and a short preview. Expand the details to review the full change.
+- The plugin checks the connection again when you change an Agent’s command, arguments, environment, or runtime.
+- Follow-up messages on the same ACP connection omit tool bridge instructions and skill catalogs already delivered. The Agent receives catalog withdrawals and a fresh snapshot on reconnect. Thanks to lukstei for the reproduction and reference implementation.
+
+## 0.2.2-rc.5.1
+
+### 中文
+
+- 本版适配 DSH `0.2.2-rc.5`。
+- 在「网页搜索与获取」中使用「自动选择」时，ACP 会话调用 DSH 的网页搜索工具会优先使用 DeepSeek Search API。原生 DeepSeek 模型优先使用 DeepSeek 服务端搜索。手动指定的搜索提供方优先生效。
+
+### English
+
+- This version targets DSH `0.2.2-rc.5`.
+- With **Automatic** selected in **Web search and fetch**, ACP sessions prefer DeepSeek Search API when calling the DSH web search tool. Native DeepSeek models prefer DeepSeek server-side search. An explicitly configured search provider takes precedence.
+
+## 0.2.2-rc.4.1
+
+### 中文
+
+- 兼容 DSH `0.2.2-rc.4`。DSH RC.3 用户请安装插件 `0.2.2-rc.3.1`。Devin CLI 需要 `3000.14.30821` 或更新版本。
+- 添加 Agent 后自动检查连接。检查失败会保留配置，修正后可直接重试。
+- 停止回复后刷新页面，即使 Agent 目录稍后才加载，也能在原回复中展开工具调用。
+- 专用 ACP 模式在原会话确认切模后更新选择。在其他模式新建 CodeBuddy 或 OpenCode 主会话时，选择**由 Agent 管理模型**也可原地切模。已有具名会话可按原模式另开，历史和草稿保留在原会话。
+- OpenCode 自定义回答保留在原问题卡上。策略插件可以接入二选一审批，Teams 批量审批只处理仍可回答的请求，全队中断操作显示在成员设置页脚。
+- 工具消费最后一条排队消息后，Agent 可以继续完成本轮任务。感谢 lukstei 提供复现和修复。Agent 拒绝插话时，会提示下次请求将跳过本轮内容。
+- 改进中英文模型名称、连接错误和切模恢复提示。配置验证失败时，焦点移到第一个出错字段。
+
+### English
+
+- Support DSH `0.2.2-rc.4`. For DSH RC.3, install plugin `0.2.2-rc.3.1`. Devin CLI requires `3000.14.30821` or later.
+- Saving a new Agent checks its connection automatically. A failed check keeps the configuration so you can correct the problem and retry.
+- After stopping a reply and refreshing the page, you can expand its tool calls even if the Agent directory loads after the conversation.
+- Dedicated ACP mode updates the model after the current Agent session confirms the switch. In other modes, start a CodeBuddy or OpenCode main chat with **Agent-managed model** to switch within that conversation. Existing named-model chats can open a separate chat in the same mode and keep their original history and draft.
+- OpenCode custom answers stay on the original question card. Policy plugins can handle binary approvals. Teams batch approvals cover only actionable requests, and the team-wide interrupt is in the member settings footer.
+- Agents can finish their turn after a tool consumes the last queued message. Thanks to lukstei for the reproduction and fix. When an Agent declines a mid-turn message, the UI explains which turn the next request will skip.
+- Improve Chinese and English model labels, connection errors, and model-switch recovery messages. Invalid configuration focuses the first field that needs attention.
+
+## 0.2.2-rc.3.1
+
+### 中文
+
+- 兼容 DSH `0.2.2-rc.3`。使用 DSH RC.2 时请安装插件 `0.2.2-rc.2.1`。
+- Agent 拒绝插话后，原回复会保持文本和思考的顺序，并保留已确认的工具结果。
+- 切换模型或从恢复页另开会话时沿用原模式。建好空白会话后所选模型消失时，可以从原会话打开它并重新选模。
+- 切换工作目录时，若 Agent 已成功分叉但本地保存中断，重试会保存同一个子会话，避免会话误锁或重复分叉。
+- 原生主会话可以管理有访问权限的 ACP 子成员。纯原生团队隐藏 ACP 成员设置。
+- 打开没有已选模型的导入对话时，若默认模型为 ACP，输入区会按当前权限与可用模型，提示如何继续原对话或另开独立 ACP 会话。
+
+### English
+
+- Support DSH `0.2.2-rc.3`. For DSH RC.2, install plugin `0.2.2-rc.2.1`.
+- When an Agent declines a mid-turn message, the original reply preserves text and reasoning order and keeps confirmed tool results.
+- New sessions opened from model switching or recovery keep the original mode. If the selected model disappears after creation, you can open the blank session from the original conversation and choose another model.
+- If an Agent forks successfully during a working directory change but saving the result fails, retrying saves the same child session.
+- Native lead sessions can manage their accessible ACP members. Teams with only native members hide ACP member settings.
+- When the default model is ACP, an imported conversation without a selected model offers the available choices for continuing with a native model or starting an independent ACP session.
+
+## 0.2.2-rc.2.1
+
+### 中文
+
+- 兼容目标更新为 DSH `0.2.2-rc.2`。使用 DSH RC.1 的用户请继续使用插件 `0.2.2-rc.1.2`。
+- ACP 成员设置整合到原生子代理目录，沿用原生成员导航和任务板。关闭 Teams 后仍可管理已有子代理；读取成员信息和修改设置均核查相关会话权限。
+- 使用原生工作目录准入保护已绑定的 Agent 上下文，在准入时拒绝不支持的目录切换。首次会话和同一实际目录的访问保持正常。
+- Devin 要求 `3000.12.43` 或更新版本，改用会话级 MCP，不再写入用户 MCP 配置。修正大型工具目录的发现指引，由 Devin 自身读取所需定义，保持原有审批规则。
+- 调整窗口大小或滚动设置页使“添加 Agent”移出视野时，目录菜单自动关闭，防止 Tab 误选隐藏的条目。
+- 修复会话恢复与关闭并发时可能遗留 Agent 进程的问题。
+
+### English
+
+- Update the compatibility target to DSH `0.2.2-rc.2`. Users on DSH RC.1 should keep plugin version `0.2.2-rc.1.2`.
+- Integrate ACP member settings into the native subagent catalog, reusing its navigation and task board. Existing subagents remain manageable after disabling Teams; member information and settings respect the relevant session permissions.
+- Protect bound Agent context through native working-directory admission, rejecting unsupported directory switches during admission. Initial sessions and access to the same physical directory remain available.
+- Require Devin `3000.12.43` or newer and use session-level MCP without writing user MCP configuration. Correct large-catalog discovery guidance so Devin reads the needed definitions itself, preserving existing approval rules.
+- Close the Agent catalog when resizing or scrolling moves its button out of view, so Tab cannot activate a hidden entry.
+- Fix Agent processes potentially surviving concurrent session recovery and shutdown.
+
+## 0.2.2-rc.1.2
+
+### 中文
+
+- 适配 DSH `0.2.2-rc.1`，修复该版本下的 DSH 工具调用失败，并显示 CodeBuddy 当前模型可用的推理档位。安装前请匹配 RC.1 宿主；本版不扩大到 RC.2。
+- 新增可选 **ACP** 模式：使用 DSH 工具，由 Agent 管理上下文。标准、PTC、极简和创造模式继续可用，不改变默认选择或已有会话；创建插件仍从原生创造入口开始。
+- 支持未提供模型目录的 ACP Agent，选择 **Agent current configuration** 即可开始会话。Kimi 已停止支持，不再启动或探测；已保存的配置和历史保留，配置可手动删除。
+- 已有 ACP 会话尝试更换模型时，保留原模型、历史和草稿，并提供独立新会话入口；新会话不继承原 Agent 上下文。同模型的推理强度仍可调整。实验性 **Auto Review** 尚未完整支持，**Auto** 审批不等于 Auto Review。
+- 恢复时优先重连原上下文，重置为空白上下文需确认。分叉已成功但记录清理失败时只重试清理；结果未知时可明确放弃该尝试，不自动重复创建。
+- 改善与 ds-bot 共存及插件热启停，停用时等待已受理工具结果和反馈收尾。修复 Teams 成员在会话重建后保存过期模式、以及中断后无法继续保存模式的问题；升级前尚未应用的旧成员偏好可能需要重选一次。
+- 精简中英文插件详情、设置和恢复提示，切换语言时保留当前操作并更新反馈文案；改善窄屏控件、触屏与键盘操作。
+- 更新 Agent 目录，保留 Claude 二进制分发的启动命令预填；Kimi Code 也不再列入目录。
+
+### English
+
+- Target DSH `0.2.2-rc.1`, fixing DSH tool-call failures on that version and showing CodeBuddy reasoning options available for the current model. Match the RC.1 host before installing; this release does not extend compatibility to RC.2.
+- Add an optional **ACP** mode with DSH tools and Agent-managed context. Standard, PTC, Minimal and Creator remain available without changing defaults or existing sessions; start plugin creation through the native Creator entry point.
+- Support ACP Agents without a model catalog through **Agent current configuration**. Retire Kimi support: it is no longer launched or probed. Saved configurations and history remain; configurations can be deleted manually.
+- Keep the original model, history and draft when attempting to change models in an established ACP session, and offer an independent new session. The new session does not inherit the original Agent context. Reasoning effort can still change on the same model. Experimental **Auto Review** remains incompletely supported; **Auto** approval is a separate feature.
+- Prefer reconnecting to the original context and confirm resets to blank context. If a fork succeeds but record cleanup fails, retry only the cleanup. Unknown creation outcomes can be explicitly abandoned without automatically creating another session.
+- Improve ds-bot coexistence and plugin hot reloads, draining accepted tool results and feedback on disable. Fix stale Teams member mode selections after session replacement and modes remaining unsavable after interruption. Older, unapplied member preferences may need to be selected again once after upgrading.
+- Simplify bilingual plugin details, settings and recovery guidance. Keep current actions and translate their feedback when changing languages; improve narrow layouts, touch and keyboard interaction.
+- Refresh the Agent catalog while preserving the launch command for Claude binary distributions. Kimi Code is also excluded from the catalog.
 
 ## 0.2.1-rc.4.1
 

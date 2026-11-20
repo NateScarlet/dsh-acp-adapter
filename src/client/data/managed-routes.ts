@@ -1,34 +1,50 @@
-import type { SettingsScopeLike } from './controller.ts'
+import { createSnapshotStore, type SnapshotSelectorHook } from '@deepseek-ai/dsh-client-store'
+import type { AcpOwnedRoutesView } from '../../contract/remote.ts'
 
-/** Client-side ownership catalogue derived from the plugin's authoritative
- * profile registry. A naming prefix is never an ownership claim. */
+const emptyRoutes: AcpOwnedRoutesView = { providers: [], historicalProviders: [] }
+const retryDelays = [250, 1_000, 4_000] as const
+
+export type UseRouteOwnership = SnapshotSelectorHook<AcpOwnedRoutesView>
+
+export function includesRoute(providers: readonly string[], provider: string | undefined): boolean {
+  return provider !== undefined && providers.includes(provider)
+}
+
+/** Only a live registration authorizes new actions. A historical route is a hint to check the session binding. */
 export class ManagedAcpRouteCatalog {
-  private routes = new Set<string>()
-  private readonly durableRoutes: ReadonlySet<string>
-  private readonly unsubscribe: () => void
+  readonly store = createSnapshotStore(emptyRoutes)
+  private revision = 0
+  private disposed = false
+  private retry?: ReturnType<typeof setTimeout>
 
-  constructor(
-    private readonly scope: SettingsScopeLike,
-    durableRoutes: Iterable<string> = [],
-  ) {
-    this.durableRoutes = new Set(durableRoutes)
-    this.routes = new Set(this.durableRoutes)
-    this.refresh()
-    this.unsubscribe = scope.subscribe(() => {
-      this.refresh()
-    })
+  constructor(private readonly read: () => Promise<AcpOwnedRoutesView | undefined>) {}
+
+  owns = (provider: string | undefined): boolean => includesRoute(this.store.getSnapshot().providers, provider)
+
+  refresh(): Promise<void> {
+    clearTimeout(this.retry)
+    return this.readRoutes(++this.revision, 0)
   }
 
-  owns = (provider: string | undefined): boolean => provider !== undefined && this.routes.has(provider)
+  private async readRoutes(revision: number, attempt: number): Promise<void> {
+    if (this.disposed || revision !== this.revision) return
+    const routes = await this.read().catch(() => undefined)
+    if (this.disposed || revision !== this.revision) return
+    this.store.set(routes ?? emptyRoutes)
+    const delay = retryDelays[attempt]
+    if (routes === undefined && delay !== undefined) {
+      this.retry = setTimeout(() => void this.readRoutes(revision, attempt + 1), delay)
+    }
+  }
+
+  reset(): void {
+    this.store.set(emptyRoutes)
+    void this.refresh()
+  }
 
   dispose(): void {
-    this.unsubscribe()
-    this.routes.clear()
-  }
-
-  private refresh(): void {
-    const agents = this.scope.getSnapshot().value?.agents
-    if (agents === undefined) return
-    this.routes = new Set([...this.durableRoutes, ...Object.keys(agents).map((id) => `acp-${id}`)])
+    this.disposed = true
+    clearTimeout(this.retry)
+    this.store.set(emptyRoutes)
   }
 }
