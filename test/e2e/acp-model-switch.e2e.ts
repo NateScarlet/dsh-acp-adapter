@@ -7,7 +7,10 @@ import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller'
 import { expect, it, vi } from 'vitest'
 import type { AcpRemoteService } from '../../src/remote/service.ts'
 import { ACP_AGENT_MANAGED_MODEL_ID } from '../../src/contract/model-selection.ts'
+import { ACP_IN_PLACE_MODEL_SWITCH_PRESETS } from '../../src/contract/model-transition.ts'
 import { launchAdapterWorld, root } from './scaffold.ts'
+
+const nativePresets = ACP_IN_PLACE_MODEL_SWITCH_PRESETS.filter((preset) => preset !== 'acp-adapter')
 
 type WireEvent = {
   method: string
@@ -179,24 +182,118 @@ it('keeps the first unsent image available to retry on a model that supports it'
   }
 })
 
-it.each(['standard', 'cordis', 'ptc', 'minimal'])(
-  'preserves the independent-session boundary for %s',
+it.each(nativePresets)('switches the ACP model in place on %s with its history preserved', async (preset) => {
+  const host = await launchAdapterWorld()
+  try {
+    const run = await start(host, preset)
+    const signal = new AbortController().signal
+    const sessions = async () =>
+      (await host.ctx.sessionController.list({}, signal)).items.map((row) => String(row.sessionId))
+    const before = await sessions()
+    expect(before).toContain(String(run.agent.id))
+    // 原生预设仍加载宿主压缩服务；上下文由外部 Agent 自行管理。
+    expect(host.ctx.agentPresets.serviceFor(run.agent, 'compaction')).toBeDefined()
+    const db = new DatabaseSync(join(host.ctx.dshHomePath!('dsh-acp'), 'sidecar.sqlite'), { readOnly: true })
+    const binding = () => {
+      const row = db.prepare('SELECT payload FROM bindings WHERE dsh_session_id=?').get(String(run.agent.id)) as
+        { payload: string } | undefined
+      if (row === undefined) throw new Error('ACP binding is missing')
+      return JSON.parse(row.payload) as { agentSessionId: string; bindingEpoch: number }
+    }
+    let beforeBinding: { agentSessionId: string; bindingEpoch: number } | undefined
+    let afterBinding: { agentSessionId: string; bindingEpoch: number } | undefined
+    try {
+      beforeBinding = binding()
+      expect((await run.submit('SECOND')).kind).toBe('completed')
+      afterBinding = binding()
+    } finally {
+      db.close()
+    }
+    // 切模不重建会话：绑定会话与代次保持不变。
+    expect(afterBinding).toEqual(beforeBinding)
+    expect(run.header()).toBe('b')
+    expect(run.prompts()).toHaveLength(2)
+    expect(run.prompts()[1]).toMatchObject({
+      session: run.prompts()[0]!.session,
+      model: 'b',
+      markers: ['SWITCH_TEST_SECOND'],
+      history: ['SWITCH_TEST_FIRST'],
+    })
+    expect(await sessions()).toEqual(before)
+    expect(run.events().some((event) => event.method === 'session/load')).toBe(false)
+  } finally {
+    await host.close()
+  }
+})
+
+it.each(nativePresets)(
+  'keeps the original ACP session after a refused switch in %s and retries on it',
   async (preset) => {
     const host = await launchAdapterWorld()
     try {
       const run = await start(host, preset)
-      expect(host.ctx.agentPresets.serviceFor(run.agent, 'compaction')).toBeDefined()
-      const result = await run.submit('SECOND')
-      expect(result.kind).toBe('error')
-      expect(JSON.stringify(result)).toContain('ACP_MODEL_SWITCH_UNAVAILABLE')
+      run.fault('refuse')
+      expect((await run.submit('SECOND')).kind).toBe('error')
       expect(run.header()).toBe('a')
-      expect(run.events().filter((e) => e.target === 'b')).toEqual([])
       expect(run.prompts()).toHaveLength(1)
+      expect(run.events().filter((event) => event.target === 'b')).toHaveLength(1)
+      await run.retry('b')
+      expect(run.header()).toBe('b')
     } finally {
       await host.close()
     }
   },
 )
+
+it.each(nativePresets)('reloads the original ACP session after a disconnect in %s', async (preset) => {
+  for (const failure of ['disconnect-before', 'disconnect-after'] as const) {
+    const host = await launchAdapterWorld()
+    try {
+      const run = await start(host, preset)
+      run.fault(failure)
+      expect((await run.submit('SECOND')).kind).toBe('error')
+      expect(run.header()).toBe('a')
+      expect(run.prompts()).toHaveLength(1)
+      const beforeRetry = run.events().length
+      await run.retry('b')
+      expect(run.header()).toBe('b')
+      const retried = run.events().slice(beforeRetry)
+      expect(retried[0]).toMatchObject({ method: 'session/load', model: failure === 'disconnect-before' ? 'a' : 'b' })
+    } finally {
+      await host.close()
+    }
+  }
+})
+
+it('verifies the original ACP session after a lost acknowledgement in a native preset', async () => {
+  const host = await launchAdapterWorld()
+  try {
+    const run = await start(host, 'standard')
+    run.fault('hold-ack')
+    const pending = run.submit('SECOND')
+    void pending.catch(() => {})
+    await vi.waitFor(() => expect(run.events().some((event) => event.applied === 'b')).toBe(true), { timeout: 10000 })
+    const plugin = (await host.ctx.pluginManager.listPlugins()).find(
+      (row) => row.moduleName === '@zaimokuza/dsh-acp-adapter',
+    )!
+    expect(await host.ctx.pluginManager.setPluginEnabled(plugin.entryId, false)).toMatchObject({
+      application: 'applied',
+    })
+    expect((await pending).kind).not.toBe('completed')
+    expect(run.header()).toBe('a')
+    expect(await host.ctx.pluginManager.setPluginEnabled(plugin.entryId, true)).toMatchObject({
+      application: 'applied',
+    })
+    await vi.waitFor(() => expect(host.ctx.llm.listProviders().some((entry) => entry.id === provider)).toBe(true))
+    const beforeRetry = run.events().length
+    await run.retry('b')
+    const retried = run.events().slice(beforeRetry)
+    expect(retried[0]).toMatchObject({ method: 'session/load', model: 'b' })
+    expect(retried.some((event) => event.target === 'b')).toBe(false)
+  } finally {
+    await host.close()
+  }
+})
 
 it.each(['refuse', 'unconfirmed', 'disconnect-before', 'disconnect-after'])(
   'keeps the committed source and retries on the original ACP session after %s',

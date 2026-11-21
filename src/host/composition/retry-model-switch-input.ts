@@ -6,6 +6,7 @@ import { pluginRecordOf, SessionId } from '@deepseek-ai/dsh-session'
 import { RemoteError, type Principal } from '@deepseek-ai/dsh-typert-protocol'
 import { unsentModelSwitchRecord, unsentModelSwitchSchema } from '../../domain/session/unsent-model-switch.ts'
 import { acpCanonicalHash16, modeIntentBindingKey, type AcpSidecar } from '../../persistence/sidecar.ts'
+import { isAcpInPlaceSwitchModel } from '../../contract/model-transition.ts'
 import { managedModelRetryNotice } from './managed-model-resend.ts'
 import { permitsManagedModelScope } from './managed-model.ts'
 import { readSessionFacts } from './session-facts.ts'
@@ -88,12 +89,14 @@ export async function retryModelSwitchInput(
     signal.throwIfAborted()
     maintenanceSignal.throwIfAborted()
     const next = agent.model.current()
+    const preset = ctx.get('agentPresets', false)?.composedPreset(agent.ctx)
+    // 原生预设现在也会原地确认具名切模，其未送达输入票据应与专用预设一样可重试。
+    const inPlaceSwitch = preset === 'acp-adapter' || isAcpInPlaceSwitchModel(preset, current.model)
     if (
       !authorized() ||
       ctx.get('agents', false)?.get(id) !== agent ||
       ctx.get('sessions', false)?.get(id) !== agent.session ||
-      (ctx.get('agentPresets', false)?.composedPreset(agent.ctx) !== 'acp-adapter' &&
-        !permitsManagedModelScope(ctx, agent, current.model)) ||
+      (!inPlaceSwitch && !permitsManagedModelScope(ctx, agent, current.model)) ||
       ctx.get('workspaceRegistry', false)?.archivedSessionIds.includes(id) ||
       agent.inbox.nextTurn.length > 0 ||
       agent.inbox.nextStep.length > 0 ||

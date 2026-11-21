@@ -9,8 +9,11 @@ import {
   type AcpSidecar,
 } from '../../../src/persistence/sidecar.ts'
 import { applySessionFact, initialSessionFacts } from '../../../src/domain/session/session-facts.ts'
+import { ACP_IN_PLACE_MODEL_SWITCH_PRESETS } from '../../../src/contract/model-transition.ts'
 
-function fixture() {
+const nativePresets = ACP_IN_PLACE_MODEL_SWITCH_PRESETS.filter((preset) => preset !== 'acp-adapter')
+
+function fixture(options: { preset?: string } = {}) {
   const source = { kind: 'user', rpcId: 'desktop-request', principal: { kind: 'acp-resource-test' as const } }
   const input = {
     id: 'original',
@@ -71,7 +74,7 @@ function fixture() {
   const services = {
     agents: { get: () => agent },
     sessions: { get: () => session },
-    agentPresets: { composedPreset: () => 'acp-adapter' },
+    agentPresets: { composedPreset: () => options.preset ?? 'acp-adapter' },
     acpSessionFacts: { read: () => facts },
     sessionQuery: { observeSession: async () => observation },
   }
@@ -107,6 +110,12 @@ describe('explicit retry of an unsent ACP input', () => {
     expect(h.info).toHaveBeenCalledWith('acp-test', 'B')
     await expect(h.retry()).rejects.toThrow()
     expect(h.agent.followup).toHaveBeenCalledTimes(1)
+  })
+  it.each(nativePresets)('offers the same explicit retry for a declared switch in %s', async (preset) => {
+    const h = fixture({ preset })
+    await expect(h.retry()).resolves.toBeUndefined()
+    expect(h.agent.followup).toHaveBeenCalledOnce()
+    expect(h.agent.followup).toHaveBeenCalledWith(h.input)
   })
   it('never inherits a retry from a fork or accepts a different sequence', async () => {
     const h = fixture()

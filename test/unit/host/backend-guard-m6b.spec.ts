@@ -4,8 +4,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 import { HarnessError, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { Session } from '@deepseek-ai/dsh-session'
-import type { AcpSidecar, AcpBindingLookup } from '../../../src/persistence/sidecar.ts'
+import type { AcpSidecar, AcpBindingLookup, AcpBindingData } from '../../../src/persistence/sidecar.ts'
 import { installAcpBackendGuard } from '../../../src/host/composition/backend-guard.ts'
+import { ACP_IN_PLACE_MODEL_SWITCH_PRESETS } from '../../../src/contract/model-transition.ts'
+
+const nativePresets = ACP_IN_PLACE_MODEL_SWITCH_PRESETS.filter((preset) => preset !== 'acp-adapter')
 
 type RequestListener = (payload: unknown, next: () => Promise<LlmCallConfig>) => Promise<LlmCallConfig>
 
@@ -60,26 +63,55 @@ function sidecar(
   } as unknown as AcpSidecar
 }
 
+interface GuardServices {
+  readonly preset?: string
+  readonly compactionService?: unknown
+  readonly confirmModelSwitch?: (
+    profileId: string,
+    sessionId: string,
+    owner: object,
+    binding: AcpBindingData,
+    target: LlmCallConfig,
+    signal: AbortSignal,
+  ) => Promise<void>
+}
+
 function install(
   selection: { lastUsed: LlmCallConfig | null; pending: LlmCallConfig | null } | undefined,
   acpSidecar: AcpSidecar,
   ownsProvider: (provider: string) => boolean = (provider) =>
     ['acp-codex', 'acp-generic', 'acp-devin'].includes(provider),
+  services: GuardServices = {},
 ): { listener: RequestListener; reads: ReturnType<typeof vi.fn> } {
   let listener: RequestListener | undefined
   const reads = vi.fn(() => selection)
+  const presets =
+    services.preset === undefined
+      ? undefined
+      : {
+          presetForSession: () => services.preset,
+          composedPreset: () => services.preset,
+          serviceFor: () => services.compactionService,
+        }
   const context = {
     inject: (_keys: readonly string[], callback: (ctx: unknown) => void) =>
       callback({
-        get: (name: string) =>
-          name === 'acpSessionFacts' ? { read: (session: { facts: unknown }) => session.facts } : undefined,
+        get: (name: string) => {
+          if (name === 'acpSessionFacts') return { read: (session: { facts: unknown }) => session.facts }
+          if (name === 'agentPresets') return presets
+          return undefined
+        },
         on: (_event: string, handler: RequestListener) => {
           listener = handler
           return () => undefined
         },
       }),
   }
-  installAcpBackendGuard(context as unknown as Context, { sidecar: acpSidecar, ownsProvider })
+  installAcpBackendGuard(context as unknown as Context, {
+    sidecar: acpSidecar,
+    ownsProvider,
+    ...(services.confirmModelSwitch === undefined ? {} : { confirmModelSwitch: services.confirmModelSwitch }),
+  })
   if (listener === undefined) throw new Error('guard listener was not installed')
   const installed = listener
   return {
@@ -96,7 +128,7 @@ function install(
   }
 }
 
-const validBinding = (profileId: string): AcpBindingLookup => ({
+const validBinding = (profileId: string): AcpBindingLookup & { status: 'ok' } => ({
   status: 'ok',
   binding: {
     profileId,
@@ -109,6 +141,13 @@ const validBinding = (profileId: string): AcpBindingLookup => ({
     establishedAt: 1,
     time: 1,
   } as never,
+})
+
+const switchPayload = (switched: Session) => ({
+  turn: 2,
+  step: 1,
+  signal: new AbortController().signal,
+  agent: { session: switched, ctx: { get: () => undefined }, inbox: { nextTurn: [], nextStep: [] } },
 })
 
 describe('ACP backend guard', () => {
@@ -189,6 +228,67 @@ describe('ACP backend guard', () => {
     expect(compact).not.toHaveBeenCalled()
     expect(acpSidecar.readLatestBinding).not.toHaveBeenCalled()
     expect(acpSidecar.writeRecoveryState).not.toHaveBeenCalled()
+  })
+
+  it.each(nativePresets)(
+    'confirms a declared model switch in %s even with the native compaction service',
+    async (preset) => {
+      const binding = validBinding('codex')
+      const acpSidecar = sidecar(binding)
+      const confirmModelSwitch = vi.fn(async () => undefined)
+      const { listener } = install({ lastUsed: config('acp-codex', 'a'), pending: null }, acpSidecar, undefined, {
+        preset,
+        compactionService: {},
+        confirmModelSwitch,
+      })
+      const switched = session(['request/header', 'assistant/message'])
+      const payload = switchPayload(switched)
+      await expect(listener(payload, async () => config('acp-codex', 'b'))).resolves.toEqual(config('acp-codex', 'b'))
+      expect(confirmModelSwitch).toHaveBeenCalledWith(
+        'codex',
+        'session-test',
+        switched,
+        binding.binding,
+        config('acp-codex', 'b'),
+        payload.signal,
+      )
+      expect(acpSidecar.readLatestBinding).toHaveBeenCalledOnce()
+      expect(acpSidecar.writeRecoveryState).not.toHaveBeenCalled()
+    },
+  )
+
+  it('surfaces the real confirmation error instead of an early preset rejection', async () => {
+    const binding = validBinding('codex')
+    const acpSidecar = sidecar(binding)
+    const failure = new Error('agent refused the model change')
+    const confirmModelSwitch = vi.fn(async () => {
+      throw failure
+    })
+    const { listener } = install({ lastUsed: config('acp-codex', 'a'), pending: null }, acpSidecar, undefined, {
+      preset: 'standard',
+      compactionService: {},
+      confirmModelSwitch,
+    })
+    const error = await listener(switchPayload(session(['request/header'])), async () =>
+      config('acp-codex', 'b'),
+    ).catch((caught: unknown) => caught)
+    expect(error).toBe(failure)
+    expect(confirmModelSwitch).toHaveBeenCalledOnce()
+    expect(acpSidecar.writeRecoveryState).not.toHaveBeenCalled()
+  })
+
+  it('retains the dedicated acp-adapter switch without a compaction service', async () => {
+    const binding = validBinding('codex')
+    const acpSidecar = sidecar(binding)
+    const confirmModelSwitch = vi.fn(async () => undefined)
+    const { listener } = install({ lastUsed: config('acp-codex', 'a'), pending: null }, acpSidecar, undefined, {
+      preset: 'acp-adapter',
+      confirmModelSwitch,
+    })
+    await expect(
+      listener(switchPayload(session(['request/header'])), async () => config('acp-codex', 'b')),
+    ).resolves.toEqual(config('acp-codex', 'b'))
+    expect(confirmModelSwitch).toHaveBeenCalledOnce()
   })
 
   it.each([

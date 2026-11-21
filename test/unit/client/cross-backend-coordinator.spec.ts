@@ -3,6 +3,7 @@ import { SessionCreateError } from '@deepseek-ai/dsh-api-session-controller/clie
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { AcpOwnedRoutesView } from '../../../src/contract/remote.ts'
 import { ACP_CURRENT_CONFIG_MODEL_ID } from '../../../src/contract/model-selection.ts'
+import { ACP_IN_PLACE_MODEL_SWITCH_PRESETS } from '../../../src/contract/model-transition.ts'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import {
   CrossBackendCoordinator,
@@ -549,10 +550,12 @@ describe('cross-backend coordinator', () => {
     stop()
   })
 
-  it('retains the independent-session handoff for non-ACP presets and unconfirmed model identities', () => {
+  it('switches in place for the dedicated and native presets, but exits for unknown presets and unconfirmed model identities', () => {
     const route = { provider: 'acp-codex', model: 'a' }
     const next = { ...route, model: 'b' }
-    for (const preset of [undefined, 'standard', 'cordis', 'ptc', 'minimal', 'custom'])
+    for (const preset of ACP_IN_PLACE_MODEL_SWITCH_PRESETS)
+      expect(shouldConfirmBackendTransition({ lastUsed: route, next, blank: false, preset }, owns)).toBe(false)
+    for (const preset of [undefined, 'custom'])
       expect(shouldConfirmBackendTransition({ lastUsed: route, next, blank: false, preset }, owns)).toBe(true)
     const current = { ...route, model: ACP_CURRENT_CONFIG_MODEL_ID }
     for (const [source, target] of [

@@ -3,15 +3,17 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
-import type {} from '@deepseek-ai/dsh-compaction'
-import type {} from '@deepseek-ai/dsh-api-session-controller/types'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { readSessionFacts } from './session-facts.ts'
 import type { AcpSidecar, AcpBindingData, AcpBindingLookup } from '../../persistence/sidecar.ts'
 import { acpCanonicalHash16, modeIntentBindingKey } from '../../persistence/sidecar.ts'
 import { unsentModelSwitchRecord } from '../../domain/session/unsent-model-switch.ts'
 import { acpAgentIdFromRoute } from '../../domain/session/agent-config.ts'
-import { isAcpPresetModelSwitch, requiresAcpModelSwitchExit } from '../../contract/model-transition.ts'
+import {
+  isAcpPresetModelSwitch,
+  permitsAcpInPlaceModelSwitch,
+  requiresAcpModelSwitchExit,
+} from '../../contract/model-transition.ts'
 
 import { isAcpAgentManagedModel } from '../../contract/model-selection.ts'
 import { managedModelResendSource, readCommittedModelRetry } from './managed-model-resend.ts'
@@ -129,19 +131,19 @@ export function installAcpBackendGuard(ctx: Context, options: AcpBackendGuardOpt
       const stableManaged = managed && previous?.provider === resolved.provider && previous.model === resolved.model
       if (stableManaged || requiresAcpModelSwitchExit(previous, resolved, options.ownsProvider)) {
         const presets = projectionCtx.get('agentPresets', false)
+        // 外部 Agent 自己管理上下文，原生压缩服务不再是拒绝理由；只有确认路径缺失
+        // 或预设无法认领这次切模时，才可能让宿主记账与远端模型不一致。
         if (
           targetProfile === undefined ||
           options.confirmModelSwitch === undefined ||
           presets === undefined ||
           (!stableManaged &&
             (!isAcpPresetModelSwitch(previous, resolved, presets.presetForSession(session)) ||
-              presets.composedPreset(payload.agent.ctx) !== 'acp-adapter' ||
-              presets.serviceFor(payload.agent, 'compaction') !== undefined ||
-              payload.agent.ctx.get('compaction', false) !== undefined))
+              !permitsAcpInPlaceModelSwitch(presets.composedPreset(payload.agent.ctx))))
         )
           throw transitionError(
             'ACP_MODEL_SWITCH_UNAVAILABLE',
-            'Keep the previous model or open a separate session with the selected model in this DSH mode.',
+            'The ACP model switch cannot be confirmed on the original session; keep the previous model or try again.',
           )
         const lookup = await options.sidecar.readLatestBinding(session.id)
         if (
